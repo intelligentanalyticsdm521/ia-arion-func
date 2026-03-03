@@ -6,8 +6,8 @@ pool:
 
 variables:
   node_version: "22.x"
-  webAppName: "app-arion-api-prod"
-  azureSubscription: "<YOUR_AZDO_SERVICE_CONNECTION_NAME>"
+  functionAppName: "func-iadm-arion-prod"
+  azureSubscription: "IADM-Prod-ARM"
 
 steps:
   - task: NodeTool@0
@@ -18,18 +18,19 @@ steps:
   - checkout: self
     clean: true
 
-  # Keep this aligned with your existing pattern.
-  # If contract-check doesn't exist yet in arion-api, either add it OR remove that line.
+  # If your function is TypeScript, add npm run build here.
+  # If it’s plain JS, build can be omitted.
   - script: |
       echo "Working directory:"
       pwd
       ls -la
       npm ci
-      npm run contract-check
-    displayName: "npm ci + contract-check"
+      if npm run | grep -q " contract-check"; then npm run contract-check; fi
+      if npm run | grep -q " build"; then npm run build; fi
+    displayName: "npm ci (+ optional contract-check/build)"
 
   - task: ArchiveFiles@2
-    displayName: "Archive app into drop.zip"
+    displayName: "Archive function app into drop.zip"
     inputs:
       rootFolderOrFile: "$(System.DefaultWorkingDirectory)"
       includeRootFolder: false
@@ -37,9 +38,10 @@ steps:
       archiveFile: "$(Build.ArtifactStagingDirectory)/drop.zip"
       replaceExistingArchive: true
 
-  - task: AzureWebApp@1
-    displayName: "Deploy drop.zip to $(webAppName)"
+  - task: AzureFunctionApp@2
+    displayName: "Deploy drop.zip to $(functionAppName)"
     inputs:
       azureSubscription: "$(azureSubscription)"
-      appName: "$(webAppName)"
+      appType: "functionAppLinux"
+      appName: "$(functionAppName)"
       package: "$(Build.ArtifactStagingDirectory)/drop.zip"
