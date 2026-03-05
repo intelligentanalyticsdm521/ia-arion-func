@@ -7,7 +7,7 @@ pool:
 variables:
   node_version: "22.x"
   functionAppName: "func-iadm-arion-prod"
-  functionAppResourceGroup: "rg-apps-prod"
+  functionAppResourceGroup: "rg-core-shared-prod"
   azureSubscription: "IADM-Prod-ARM"
 
 steps:
@@ -19,7 +19,6 @@ steps:
   - checkout: self
     clean: true
 
-  # Install deps and (optional) build
   - script: |
       set -e
       echo "Working directory:"
@@ -39,14 +38,13 @@ steps:
         npm run build
       fi
 
-      # Keep package smaller (optional, but recommended)
       echo "Pruning dev dependencies..."
       npm prune --omit=dev
 
       echo "Done."
     displayName: "npm install (+ optional contract-check/build) + prune"
 
-  # Zip the repo INCLUDING node_modules (Flex requires runnable package)
+  # Zip the repo including node_modules (safe and deterministic)
   - script: |
       set -e
       cd "$(System.DefaultWorkingDirectory)"
