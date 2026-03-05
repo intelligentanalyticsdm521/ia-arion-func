@@ -19,19 +19,15 @@ steps:
   - checkout: self
     clean: true
 
+  # Install deps and (optional) build
   - script: |
       set -e
       echo "Working directory:"
       pwd
       ls -la
 
-      if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
-        echo "Lockfile found. Running npm ci..."
-        npm ci
-      else
-        echo "No lockfile found. Running npm install..."
-        npm install
-      fi
+      echo "Installing dependencies..."
+      npm install
 
       if npm run | grep -q " contract-check"; then
         echo "Running contract-check..."
@@ -42,60 +38,28 @@ steps:
         echo "Running build..."
         npm run build
       fi
-    displayName: "Install deps (+ optional contract-check/build)"
 
-  - task: ArchiveFiles@2
-    displayName: "Archive function app into drop.zip"
-    inputs:
-      rootFolderOrFile: "$(System.DefaultWorkingDirectory)"
-      includeRootFolder: false
-      archiveType: "zip"
-      archiveFile: "$(Build.ArtifactStagingDirectory)/drop.zip"
-      replaceExistingArchive: true
-      verbose: true
+      # Keep package smaller (optional, but recommended)
+      echo "Pruning dev dependencies..."
+      npm prune --omit=dev
 
-  # ---- PRE-FLIGHT: MUST RUN BEFORE DEPLOY ON FLEX ----
-  - task: AzureCLI@2
-    displayName: "Flex preflight: set required DEPLOYMENT_STORAGE_CONNECTION_STRING"
-    inputs:
-      azureSubscription: "$(azureSubscription)"
-      scriptType: "bash"
-      scriptLocation: "inlineScript"
-      inlineScript: |
-        set -e
+      echo "Done."
+    displayName: "npm install (+ optional contract-check/build) + prune"
 
-        if [ -z "$DEPLOYMENT_STORAGE_CONNECTION_STRING" ]; then
-          echo "ERROR: DEPLOYMENT_STORAGE_CONNECTION_STRING pipeline variable is empty/missing."
-          exit 1
-        fi
+  # Zip the repo INCLUDING node_modules (Flex requires runnable package)
+  - script: |
+      set -e
+      cd "$(System.DefaultWorkingDirectory)"
+      echo "Creating deployment zip..."
+      zip -r "$(Build.ArtifactStagingDirectory)/drop.zip" . \
+        -x ".git/*" \
+           ".gitignore" \
+           "azure-pipelines.yml" \
+           "*.log" \
+           "**/*.log"
+      ls -lh "$(Build.ArtifactStagingDirectory)/drop.zip"
+    displayName: "Create drop.zip (includes node_modules)"
 
-        echo "Pipeline secret injected (length only): ${#DEPLOYMENT_STORAGE_CONNECTION_STRING}"
-
-        echo "Setting Function App appsetting DEPLOYMENT_STORAGE_CONNECTION_STRING..."
-        az functionapp config appsettings set \
-          --name "$(functionAppName)" \
-          --resource-group "$(functionAppResourceGroup)" \
-          --settings DEPLOYMENT_STORAGE_CONNECTION_STRING="$DEPLOYMENT_STORAGE_CONNECTION_STRING" \
-          1>/dev/null
-
-        echo "Restarting Function App..."
-        az functionapp restart \
-          --name "$(functionAppName)" \
-          --resource-group "$(functionAppResourceGroup)" \
-          1>/dev/null
-
-        echo "Verifying the key exists (names only)..."
-        az functionapp config appsettings list \
-          --name "$(functionAppName)" \
-          --resource-group "$(functionAppResourceGroup)" \
-          --query "[?name=='DEPLOYMENT_STORAGE_CONNECTION_STRING'].name | [0]" -o tsv
-
-        echo "Preflight complete."
-
-    env:
-      DEPLOYMENT_STORAGE_CONNECTION_STRING: $(DEPLOYMENT_STORAGE_CONNECTION_STRING)
-
-  # ---- DEPLOY ----
   - task: AzureCLI@2
     displayName: "Deploy drop.zip to $(functionAppName) via az config-zip"
     inputs:
