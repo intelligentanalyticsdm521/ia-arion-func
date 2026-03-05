@@ -54,9 +54,9 @@ steps:
       replaceExistingArchive: true
       verbose: true
 
-  # --- FLEX FIX: ensure DEPLOYMENT_STORAGE_CONNECTION_STRING has a real value ---
+  # ---- PRE-FLIGHT: MUST RUN BEFORE DEPLOY ON FLEX ----
   - task: AzureCLI@2
-    displayName: "Flex preflight: force DEPLOYMENT_STORAGE_CONNECTION_STRING"
+    displayName: "Flex preflight: set required DEPLOYMENT_STORAGE_CONNECTION_STRING"
     inputs:
       azureSubscription: "$(azureSubscription)"
       scriptType: "bash"
@@ -64,38 +64,49 @@ steps:
       inlineScript: |
         set -e
 
-        echo "Reading AzureWebJobsStorage..."
-        AZWJS=$(az functionapp config appsettings list \
-          --name "$(functionAppName)" \
-          --resource-group "$(functionAppResourceGroup)" \
-          --query "[?name=='AzureWebJobsStorage'].value | [0]" -o tsv)
-
-        if [ -z "$AZWJS" ]; then
-          echo "ERROR: AzureWebJobsStorage is missing or empty. Flex deployment cannot proceed."
+        if [ -z "$DEPLOYMENT_STORAGE_CONNECTION_STRING" ]; then
+          echo "ERROR: DEPLOYMENT_STORAGE_CONNECTION_STRING pipeline variable is empty/missing."
           exit 1
         fi
 
-        echo "Setting DEPLOYMENT_STORAGE_CONNECTION_STRING to match AzureWebJobsStorage (required by Flex deployment config)..."
+        echo "Pipeline secret injected (length only): ${#DEPLOYMENT_STORAGE_CONNECTION_STRING}"
+
+        echo "Setting Function App appsetting DEPLOYMENT_STORAGE_CONNECTION_STRING..."
         az functionapp config appsettings set \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
-          --settings DEPLOYMENT_STORAGE_CONNECTION_STRING="$AZWJS" \
+          --settings DEPLOYMENT_STORAGE_CONNECTION_STRING="$DEPLOYMENT_STORAGE_CONNECTION_STRING" \
           1>/dev/null
 
-        echo "Restarting function app to ensure settings are loaded..."
+        echo "Restarting Function App..."
         az functionapp restart \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
           1>/dev/null
 
+        echo "Verifying the key exists (names only)..."
+        az functionapp config appsettings list \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)" \
+          --query "[?name=='DEPLOYMENT_STORAGE_CONNECTION_STRING'].name | [0]" -o tsv
+
         echo "Preflight complete."
 
-  # --- Supported Flex deployment task ---
-  - task: AzureFunctionApp@2
-    displayName: "Deploy drop.zip to $(functionAppName) (Flex Consumption)"
+    env:
+      DEPLOYMENT_STORAGE_CONNECTION_STRING: $(DEPLOYMENT_STORAGE_CONNECTION_STRING)
+
+  # ---- DEPLOY ----
+  - task: AzureCLI@2
+    displayName: "Deploy drop.zip to $(functionAppName) via az config-zip"
     inputs:
       azureSubscription: "$(azureSubscription)"
-      appType: "functionAppLinux"
-      appName: "$(functionAppName)"
-      package: "$(Build.ArtifactStagingDirectory)/drop.zip"
-      isFlexConsumption: true
+      scriptType: "bash"
+      scriptLocation: "inlineScript"
+      inlineScript: |
+        set -e
+        echo "Deploying zip package..."
+        az functionapp deployment source config-zip \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)" \
+          --src "$(Build.ArtifactStagingDirectory)/drop.zip"
+        echo "Deployment complete."
