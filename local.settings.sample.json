@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "node",
+    "AUTH_MODE": "AZURE_CLI",
+    "SERVICES_SQL_SERVER": "<sql-server>",
+    "SERVICES_SQL_DATABASE": "iadm_services",
+    "SQL_CONNECT_TIMEOUT_MS": "12000",
+    "SQL_REQUEST_TIMEOUT_MS": "15000",
+    "ARION_STALE_HEALTH_HOURS": "24"
+  }
+}
