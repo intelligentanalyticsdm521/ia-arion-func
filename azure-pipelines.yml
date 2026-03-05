@@ -1,0 +1,47 @@
+trigger:
+  - main
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  node_version: "22.x"
+  functionAppName: "func-iadm-arion-prod"
+  azureSubscription: "IADM-Prod-ARM"
+
+steps:
+  - task: NodeTool@0
+    displayName: "Use Node $(node_version)"
+    inputs:
+      versionSpec: "$(node_version)"
+
+  - checkout: self
+    clean: true
+
+  # If your function is TypeScript, add npm run build here.
+  # If it’s plain JS, build can be omitted.
+  - script: |
+      echo "Working directory:"
+      pwd
+      ls -la
+      npm ci
+      if npm run | grep -q " contract-check"; then npm run contract-check; fi
+      if npm run | grep -q " build"; then npm run build; fi
+    displayName: "npm ci (+ optional contract-check/build)"
+
+  - task: ArchiveFiles@2
+    displayName: "Archive function app into drop.zip"
+    inputs:
+      rootFolderOrFile: "$(System.DefaultWorkingDirectory)"
+      includeRootFolder: false
+      archiveType: "zip"
+      archiveFile: "$(Build.ArtifactStagingDirectory)/drop.zip"
+      replaceExistingArchive: true
+
+  - task: AzureFunctionApp@2
+    displayName: "Deploy drop.zip to $(functionAppName)"
+    inputs:
+      azureSubscription: "$(azureSubscription)"
+      appType: "functionAppLinux"
+      appName: "$(functionAppName)"
+      package: "$(Build.ArtifactStagingDirectory)/drop.zip"
