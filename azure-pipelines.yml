@@ -1,12 +1,13 @@
 trigger:
   - main
- 
+
 pool:
   vmImage: "ubuntu-latest"
 
 variables:
   node_version: "22.x"
   functionAppName: "func-iadm-arion-prod"
+  functionAppResourceGroup: "rg-apps-prod"
   azureSubscription: "IADM-Prod-ARM"
 
 steps:
@@ -18,15 +19,23 @@ steps:
   - checkout: self
     clean: true
 
-  # If your function is TypeScript, add npm run build here.
-  # If it’s plain JS, build can be omitted.
   - script: |
+      set -e
       echo "Working directory:"
       pwd
       ls -la
+
       npm ci
-      if npm run | grep -q " contract-check"; then npm run contract-check; fi
-      if npm run | grep -q " build"; then npm run build; fi
+
+      if npm run | grep -q " contract-check"; then
+        echo "Running contract-check..."
+        npm run contract-check
+      fi
+
+      if npm run | grep -q " build"; then
+        echo "Running build..."
+        npm run build
+      fi
     displayName: "npm ci (+ optional contract-check/build)"
 
   - task: ArchiveFiles@2
@@ -37,11 +46,30 @@ steps:
       archiveType: "zip"
       archiveFile: "$(Build.ArtifactStagingDirectory)/drop.zip"
       replaceExistingArchive: true
+      verbose: true
 
-  - task: AzureFunctionApp@2
-    displayName: "Deploy drop.zip to $(functionAppName)"
+  - task: AzureCLI@2
+    displayName: "Deploy drop.zip to $(functionAppName) (Flex Consumption) via az config-zip"
     inputs:
       azureSubscription: "$(azureSubscription)"
-      appType: "functionAppLinux"
-      appName: "$(functionAppName)"
-      package: "$(Build.ArtifactStagingDirectory)/drop.zip"
+      scriptType: "bash"
+      scriptLocation: "inlineScript"
+      inlineScript: |
+        set -e
+        echo "Azure CLI version:"
+        az --version
+
+        echo "Validating Function App exists..."
+        az functionapp show \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)" \
+          --query "{name:name, kind:kind, state:state, defaultHostName:defaultHostName}" \
+          -o table
+
+        echo "Deploying zip package..."
+        az functionapp deployment source config-zip \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)" \
+          --src "$(Build.ArtifactStagingDirectory)/drop.zip"
+
+        echo "Deployment complete."
