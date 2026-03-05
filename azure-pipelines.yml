@@ -25,7 +25,13 @@ steps:
       pwd
       ls -la
 
-      npm ci
+      if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+        echo "Lockfile found. Running npm ci..."
+        npm ci
+      else
+        echo "No lockfile found. Running npm install..."
+        npm install
+      fi
 
       if npm run | grep -q " contract-check"; then
         echo "Running contract-check..."
@@ -36,7 +42,7 @@ steps:
         echo "Running build..."
         npm run build
       fi
-    displayName: "npm ci (+ optional contract-check/build)"
+    displayName: "Install deps (+ optional contract-check/build)"
 
   - task: ArchiveFiles@2
     displayName: "Archive function app into drop.zip"
@@ -48,28 +54,48 @@ steps:
       replaceExistingArchive: true
       verbose: true
 
+  # --- FLEX FIX: ensure DEPLOYMENT_STORAGE_CONNECTION_STRING has a real value ---
   - task: AzureCLI@2
-    displayName: "Deploy drop.zip to $(functionAppName) (Flex Consumption) via az config-zip"
+    displayName: "Flex preflight: force DEPLOYMENT_STORAGE_CONNECTION_STRING"
     inputs:
       azureSubscription: "$(azureSubscription)"
       scriptType: "bash"
       scriptLocation: "inlineScript"
       inlineScript: |
         set -e
-        echo "Azure CLI version:"
-        az --version
 
-        echo "Validating Function App exists..."
-        az functionapp show \
+        echo "Reading AzureWebJobsStorage..."
+        AZWJS=$(az functionapp config appsettings list \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
-          --query "{name:name, kind:kind, state:state, defaultHostName:defaultHostName}" \
-          -o table
+          --query "[?name=='AzureWebJobsStorage'].value | [0]" -o tsv)
 
-        echo "Deploying zip package..."
-        az functionapp deployment source config-zip \
+        if [ -z "$AZWJS" ]; then
+          echo "ERROR: AzureWebJobsStorage is missing or empty. Flex deployment cannot proceed."
+          exit 1
+        fi
+
+        echo "Setting DEPLOYMENT_STORAGE_CONNECTION_STRING to match AzureWebJobsStorage (required by Flex deployment config)..."
+        az functionapp config appsettings set \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
-          --src "$(Build.ArtifactStagingDirectory)/drop.zip"
+          --settings DEPLOYMENT_STORAGE_CONNECTION_STRING="$AZWJS" \
+          1>/dev/null
 
-        echo "Deployment complete."
+        echo "Restarting function app to ensure settings are loaded..."
+        az functionapp restart \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)" \
+          1>/dev/null
+
+        echo "Preflight complete."
+
+  # --- Supported Flex deployment task ---
+  - task: AzureFunctionApp@2
+    displayName: "Deploy drop.zip to $(functionAppName) (Flex Consumption)"
+    inputs:
+      azureSubscription: "$(azureSubscription)"
+      appType: "functionAppLinux"
+      appName: "$(functionAppName)"
+      package: "$(Build.ArtifactStagingDirectory)/drop.zip"
+      isFlexConsumption: true
