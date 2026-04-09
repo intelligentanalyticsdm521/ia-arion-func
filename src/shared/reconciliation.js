@@ -2,8 +2,10 @@ import sql from "mssql";
 
 export async function reconcileArtifacts(pool, logger) {
   const sitesResult = await pool.request().query(`
-    SELECT s.site_id, s.tenant_id, s.ssl_status, s.primary_domain, t.full_name, t.name
-    FROM arion.sites s
+    SELECT s.site_id, s.tenant_id, s.domain, s.ssl_expiry,
+           s.gbp_connected, s.gsc_connected, s.bing_connected,
+           t.full_name, t.name
+    FROM arion.site s
     JOIN core.tenants t
       ON t.tenant_id = s.tenant_id;
   `);
@@ -13,45 +15,31 @@ export async function reconcileArtifacts(pool, logger) {
   let healthCreated = 0;
 
   for (const site of sitesResult.recordset) {
-    const integrationsResult = await pool
-      .request()
-      .input("site_id", sql.UniqueIdentifier, site.site_id)
-      .query(`
-        SELECT provider_code, status
-        FROM arion.site_integrations
-        WHERE site_id = @site_id;
-      `);
+    // Integration status now comes directly from arion.site BIT columns
+    const ga4Connected = site.gsc_connected ? true : false;
+    const searchConsoleConnected = site.gsc_connected ? true : false;
+    const bingWebmasterConnected = site.bing_connected ? true : false;
 
-    const providers = new Set(
-      (integrationsResult.recordset || [])
-        .filter((row) => String(row.status || "").toUpperCase() === "ACTIVE")
-        .map((row) => String(row.provider_code || "").toUpperCase())
-    );
-
-    const ga4Connected = providers.has("GOOGLE_ANALYTICS");
-    const searchConsoleConnected = providers.has("GOOGLE_SEARCH_CONSOLE");
-    const bingWebmasterConnected = providers.has("BING_WEBMASTER");
-
+    // Upsert into arion.se_ranking_summary for SEO status tracking
     const seoExisting = await pool
       .request()
       .input("site_id", sql.UniqueIdentifier, site.site_id)
-      .query(`SELECT TOP 1 site_seo_status_id FROM arion.site_seo_status WHERE site_id = @site_id ORDER BY updated_at DESC, created_at DESC;`);
+      .query(`SELECT TOP 1 summary_id FROM arion.se_ranking_summary WHERE site_id = @site_id ORDER BY fetched_at DESC;`);
 
-    if (seoExisting.recordset[0]?.site_seo_status_id) {
+    if (seoExisting.recordset[0]?.summary_id) {
       await pool
         .request()
-        .input("site_seo_status_id", sql.UniqueIdentifier, seoExisting.recordset[0].site_seo_status_id)
+        .input("summary_id", sql.UniqueIdentifier, seoExisting.recordset[0].summary_id)
         .input("ga4_connected", sql.Bit, ga4Connected)
         .input("search_console_connected", sql.Bit, searchConsoleConnected)
         .input("bing_webmaster_connected", sql.Bit, bingWebmasterConnected)
         .query(`
-          UPDATE arion.site_seo_status
+          UPDATE arion.se_ranking_summary
           SET ga4_connected = @ga4_connected,
               search_console_connected = @search_console_connected,
               bing_webmaster_connected = @bing_webmaster_connected,
-              updated_at = SYSUTCDATETIME(),
-              last_checked_at = SYSUTCDATETIME()
-          WHERE site_seo_status_id = @site_seo_status_id;
+              fetched_at = SYSUTCDATETIME()
+          WHERE summary_id = @summary_id;
         `);
     } else {
       await pool
@@ -62,13 +50,13 @@ export async function reconcileArtifacts(pool, logger) {
         .input("search_console_connected", sql.Bit, searchConsoleConnected)
         .input("bing_webmaster_connected", sql.Bit, bingWebmasterConnected)
         .query(`
-          INSERT INTO arion.site_seo_status (
+          INSERT INTO arion.se_ranking_summary (
             tenant_id,
             site_id,
             ga4_connected,
             search_console_connected,
             bing_webmaster_connected,
-            last_checked_at
+            fetched_at
           )
           VALUES (
             @tenant_id,
@@ -93,7 +81,7 @@ export async function reconcileArtifacts(pool, logger) {
         .input("tenant_id", sql.UniqueIdentifier, site.tenant_id)
         .input("site_id", sql.UniqueIdentifier, site.site_id)
         .input("business_name", sql.NVarChar(500), site.full_name || site.name || null)
-        .input("google_maps_url", sql.NVarChar(500), site.primary_domain ? `https://www.google.com/search?q=${encodeURIComponent(site.primary_domain)}` : null)
+        .input("google_maps_url", sql.NVarChar(500), site.domain ? `https://www.google.com/search?q=${encodeURIComponent(site.domain)}` : null)
         .query(`
           INSERT INTO arion.site_presence (
             tenant_id,
@@ -111,6 +99,11 @@ export async function reconcileArtifacts(pool, logger) {
       presenceCreated += 1;
     }
 
+    // Derive SSL status from ssl_expiry column
+    const sslStatus = site.ssl_expiry
+      ? (new Date(site.ssl_expiry) > new Date() ? 'valid' : 'expired')
+      : null;
+
     const healthExisting = await pool
       .request()
       .input("site_id", sql.UniqueIdentifier, site.site_id)
@@ -121,7 +114,7 @@ export async function reconcileArtifacts(pool, logger) {
         .request()
         .input("tenant_id", sql.UniqueIdentifier, site.tenant_id)
         .input("site_id", sql.UniqueIdentifier, site.site_id)
-        .input("ssl_status", sql.VarChar(50), site.ssl_status || null)
+        .input("ssl_status", sql.VarChar(50), sslStatus)
         .query(`
           INSERT INTO arion.site_health (
             tenant_id,
