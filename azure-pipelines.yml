@@ -44,7 +44,6 @@ steps:
       echo "Done."
     displayName: "npm install (+ optional contract-check/build) + prune"
 
-  # Zip the repo including node_modules (safe and deterministic)
   - script: |
       set -e
       cd "$(System.DefaultWorkingDirectory)"
@@ -58,17 +57,25 @@ steps:
       ls -lh "$(Build.ArtifactStagingDirectory)/drop.zip"
     displayName: "Create drop.zip (includes node_modules)"
 
+  # Deploy via `az webapp deploy` — uses the modern OneDeploy endpoint at
+  # /api/publish, which accepts AAD bearer tokens from the pipeline service
+  # principal. This lets SCM basic auth stay DISABLED (security best practice
+  # in Azure 2024+). The SP needs Website Contributor RBAC on the function app,
+  # which is granted via the AzureCLI@2 service connection.
   - task: AzureCLI@2
-    displayName: "Deploy drop.zip to $(functionAppName) via az config-zip"
+    displayName: "Deploy drop.zip to $(functionAppName) via OneDeploy"
     inputs:
       azureSubscription: "$(azureSubscription)"
       scriptType: "bash"
       scriptLocation: "inlineScript"
       inlineScript: |
         set -e
-        echo "Deploying zip package..."
-        az functionapp deployment source config-zip \
+        echo "Deploying zip package via az webapp deploy (OneDeploy)..."
+        az webapp deploy \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
-          --src "$(Build.ArtifactStagingDirectory)/drop.zip"
+          --src-path "$(Build.ArtifactStagingDirectory)/drop.zip" \
+          --type zip \
+          --track-status false \
+          --async false
         echo "Deployment complete."
