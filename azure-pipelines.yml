@@ -9,6 +9,10 @@ variables:
   functionAppName: "func-iadm-arion-prod"
   functionAppResourceGroup: "rg-core-shared-prod"
   azureSubscription: "IADM-Prod-ARM"
+  # Storage used for Run-From-Package blob hosting. Reuses the account that
+  # backs AzureWebJobsStorage so we don't introduce a new resource.
+  storageAccount: "iadmwebhooksprodstg"
+  storageContainer: "app-package-arion-func"
 
 steps:
   - task: NodeTool@0
@@ -57,25 +61,89 @@ steps:
       ls -lh "$(Build.ArtifactStagingDirectory)/drop.zip"
     displayName: "Create drop.zip (includes node_modules)"
 
-  # Deploy via `az webapp deploy` — uses the modern OneDeploy endpoint at
-  # /api/publish, which accepts AAD bearer tokens from the pipeline service
-  # principal. This lets SCM basic auth stay DISABLED (security best practice
-  # in Azure 2024+). The SP needs Website Contributor RBAC on the function app,
-  # which is granted via the AzureCLI@2 service connection.
+  # Deploy via Run-From-Package (RFP) — the Microsoft-recommended pattern
+  # for Windows Consumption function apps. Avoids SCM entirely:
+  #   1. Upload the zip to a blob container in AzureWebJobsStorage
+  #   2. Generate a read-only SAS URL valid 10 years
+  #   3. Set WEBSITE_RUN_FROM_PACKAGE to that URL
+  #   4. Restart so the Function host picks up the new package at cold-start
+  #
+  # Benefits over SCM zipdeploy:
+  #   - No SCM basic auth needed (stays disabled — security best practice)
+  #   - No 230s SCM timeout on large packages (common on Consumption)
+  #   - Atomic swap — old package stays runnable if deploy aborts mid-way
+  #   - Same pattern the Azure Functions team recommends for CI/CD since 2021
   - task: AzureCLI@2
-    displayName: "Deploy drop.zip to $(functionAppName) via OneDeploy"
+    displayName: "Deploy via Run-From-Package"
     inputs:
       azureSubscription: "$(azureSubscription)"
       scriptType: "bash"
       scriptLocation: "inlineScript"
       inlineScript: |
         set -e
-        echo "Deploying zip package via az webapp deploy (OneDeploy)..."
-        az webapp deploy \
+
+        BLOB_NAME="arion-func-$(Build.BuildId)-$(Build.SourceVersion).zip"
+        ZIP_PATH="$(Build.ArtifactStagingDirectory)/drop.zip"
+
+        # Use the storage account key (SP has management Contributor which can
+        # call listKeys). Avoids needing separate data-plane RBAC roles.
+        echo "Fetching storage account key..."
+        ACCOUNT_KEY=$(az storage account keys list \
+          --account-name "$(storageAccount)" \
+          --query "[0].value" -o tsv)
+
+        if [ -z "$ACCOUNT_KEY" ]; then
+          echo "ERROR: Could not fetch storage account key"
+          exit 1
+        fi
+
+        echo "Ensuring blob container $(storageContainer) exists..."
+        az storage container create \
+          --account-name "$(storageAccount)" \
+          --account-key "$ACCOUNT_KEY" \
+          --name "$(storageContainer)" \
+          --public-access off \
+          --only-show-errors \
+          2>&1 || echo "(container may already exist)"
+
+        echo "Uploading $ZIP_PATH to $(storageAccount)/$(storageContainer)/$BLOB_NAME..."
+        az storage blob upload \
+          --account-name "$(storageAccount)" \
+          --account-key "$ACCOUNT_KEY" \
+          --container-name "$(storageContainer)" \
+          --name "$BLOB_NAME" \
+          --file "$ZIP_PATH" \
+          --overwrite \
+          --only-show-errors
+
+        echo "Generating 10-year read-only SAS..."
+        EXPIRY=$(date -u -d "+3650 days" +"%Y-%m-%dT%H:%MZ")
+        SAS_URL=$(az storage blob generate-sas \
+          --account-name "$(storageAccount)" \
+          --account-key "$ACCOUNT_KEY" \
+          --container-name "$(storageContainer)" \
+          --name "$BLOB_NAME" \
+          --permissions r \
+          --expiry "$EXPIRY" \
+          --https-only \
+          --full-uri \
+          --output tsv)
+
+        if [ -z "$SAS_URL" ]; then
+          echo "ERROR: SAS generation returned empty result"
+          exit 1
+        fi
+
+        echo "Setting WEBSITE_RUN_FROM_PACKAGE on $(functionAppName)..."
+        az functionapp config appsettings set \
           --name "$(functionAppName)" \
           --resource-group "$(functionAppResourceGroup)" \
-          --src-path "$(Build.ArtifactStagingDirectory)/drop.zip" \
-          --type zip \
-          --track-status false \
-          --async false
-        echo "Deployment complete."
+          --settings "WEBSITE_RUN_FROM_PACKAGE=$SAS_URL" \
+          --output none
+
+        echo "Restarting $(functionAppName) to load new package..."
+        az functionapp restart \
+          --name "$(functionAppName)" \
+          --resource-group "$(functionAppResourceGroup)"
+
+        echo "Deployment complete. Function app is running the new package."
