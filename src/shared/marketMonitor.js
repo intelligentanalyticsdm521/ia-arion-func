@@ -131,38 +131,46 @@ export async function runMovesCapture(pool, log) {
         }
       }
 
-      // Competitor positions via SE Ranking Project API.
-      // NOTE (2026-04-19): /sites/{projectId}/competitors returns HTTP 400 on
-      // all tried parameter combinations. Multiple candidate paths tried —
-      // all 400. Likely causes: SE Ranking API regression, missing competitor
-      // configuration in the project, or plan-tier gating. Until resolved,
-      // log the failure per site and skip competitor capture so the Moves
-      // job still completes successfully for own-site data.
+      // Competitor positions via SE Ranking Project API — CORRECT endpoints:
+      //   GET /competitors/site/{site_id}            → list competitors for project
+      //   GET /competitors/{competitor_id}/positions → daily positions per engine per keyword
       //
-      // Re-enable competitor capture once we confirm a working endpoint —
-      // check with SE Ranking support or probe via /arion/seo/diagnostic.
-      const engineIds = Array.from(new Set(engineBlocks.map((b) => String(b.site_engine_id || "")).filter(Boolean)));
-      let competitorCaptureAttempted = false;
-      let competitorCaptureSucceeded = false;
-      for (const engineId of engineIds) {
-        const compPosRaw = await projectApi("GET", `/sites/${encodeURIComponent(projectId)}/competitors/positions?se_id=${encodeURIComponent(engineId)}`);
-        competitorCaptureAttempted = true;
-        if (!compPosRaw.ok) continue;
-        const compKeywords = Array.isArray(compPosRaw.data) ? compPosRaw.data : [];
-        if (compKeywords.length === 0) continue;
-        competitorCaptureSucceeded = true;
+      // The endpoint we were previously using (/sites/{id}/competitors?se_id=X)
+      // returns 400 in the current v4 API. Fixed 2026-04-19 after reading the
+      // Project API docs.
+      const compListRaw = await projectApi("GET", `/competitors/site/${encodeURIComponent(projectId)}`);
+      const competitors = compListRaw.ok && Array.isArray(compListRaw.data) ? compListRaw.data : [];
 
-        for (const cp of compKeywords) {
-          const keywordId = String(cp.keyword_id || cp.id || "");
-          const keywordText = String(cp.keyword || cp.name || "").slice(0, 499);
-          const competitors = Array.isArray(cp.competitors) ? cp.competitors : [];
+      if (competitors.length === 0) {
+        log(`[moves] ${site.domain}: no competitors tracked in SE Ranking project (or /competitors/site returned empty).`);
+      }
 
-          for (const c of competitors) {
-            const domain = String(c.url || c.domain || "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "").slice(0, 299);
-            if (!domain) continue;
-            const positions = Array.isArray(c.positions) ? c.positions : [];
+      for (const comp of competitors) {
+        const compId = String(comp.id || "");
+        if (!compId) continue;
+        const compDomain = String(comp.url || comp.name || "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "").slice(0, 299);
+        if (!compDomain) continue;
+
+        // Positions for this specific competitor across all engines/keywords
+        const posRaw = await projectApi("GET", `/competitors/${encodeURIComponent(compId)}/positions`);
+        if (!posRaw.ok) {
+          log(`[moves] ${site.domain}: competitor ${compDomain} positions fetch failed — HTTP ${posRaw.status}`);
+          continue;
+        }
+        const engineBlocksForComp = Array.isArray(posRaw.data) ? posRaw.data : [];
+
+        for (const block of engineBlocksForComp) {
+          const engineId = String(block.site_engine_id || "");
+          const keywords = Array.isArray(block.keywords) ? block.keywords : [];
+
+          for (const kw of keywords) {
+            const keywordId = String(kw.id || "");
+            const keywordText = String(kw.name || "").slice(0, 499);
+            const positions = Array.isArray(kw.positions) ? kw.positions : [];
             const mostRecent = positions[positions.length - 1] || {};
-            const pos = Number(mostRecent.pos || c.position || 0) || null;
+            // SE Ranking uses pos=0 and/or pos=100+ for "not in top 100"
+            const rawPos = Number(mostRecent.pos || 0);
+            const pos = rawPos > 0 && rawPos < 100 ? rawPos : null;
 
             await pool.request()
               .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
@@ -171,7 +179,7 @@ export async function runMovesCapture(pool, log) {
               .input("engineId", sql.NVarChar(50), engineId)
               .input("keywordId", sql.NVarChar(50), keywordId)
               .input("keyword", sql.NVarChar(500), keywordText)
-              .input("compDomain", sql.NVarChar(300), domain)
+              .input("compDomain", sql.NVarChar(300), compDomain)
               .input("pos", sql.Int, pos)
               .input("recordedFor", sql.Date, today)
               .query(`
@@ -190,10 +198,6 @@ export async function runMovesCapture(pool, log) {
             siteRows++;
           }
         }
-      }
-
-      if (competitorCaptureAttempted && !competitorCaptureSucceeded) {
-        log(`[moves] ${site.domain}: competitor capture returned no data — SE Ranking /competitors endpoint may be unavailable or no competitors configured. Own-site positions captured successfully.`);
       }
 
       totalRows += siteRows;
