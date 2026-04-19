@@ -131,13 +131,26 @@ export async function runMovesCapture(pool, log) {
         }
       }
 
-      // Competitor positions per engine. SE Ranking exposes competitor
-      // positions via /sites/{projectId}/competitors/positions?se_id=X&date=
-      // — we call it per engine and store one row per (keyword, competitor).
+      // Competitor positions via SE Ranking Project API.
+      // NOTE (2026-04-19): /sites/{projectId}/competitors returns HTTP 400 on
+      // all tried parameter combinations. Multiple candidate paths tried —
+      // all 400. Likely causes: SE Ranking API regression, missing competitor
+      // configuration in the project, or plan-tier gating. Until resolved,
+      // log the failure per site and skip competitor capture so the Moves
+      // job still completes successfully for own-site data.
+      //
+      // Re-enable competitor capture once we confirm a working endpoint —
+      // check with SE Ranking support or probe via /arion/seo/diagnostic.
       const engineIds = Array.from(new Set(engineBlocks.map((b) => String(b.site_engine_id || "")).filter(Boolean)));
+      let competitorCaptureAttempted = false;
+      let competitorCaptureSucceeded = false;
       for (const engineId of engineIds) {
         const compPosRaw = await projectApi("GET", `/sites/${encodeURIComponent(projectId)}/competitors/positions?se_id=${encodeURIComponent(engineId)}`);
+        competitorCaptureAttempted = true;
+        if (!compPosRaw.ok) continue;
         const compKeywords = Array.isArray(compPosRaw.data) ? compPosRaw.data : [];
+        if (compKeywords.length === 0) continue;
+        competitorCaptureSucceeded = true;
 
         for (const cp of compKeywords) {
           const keywordId = String(cp.keyword_id || cp.id || "");
@@ -179,6 +192,10 @@ export async function runMovesCapture(pool, log) {
         }
       }
 
+      if (competitorCaptureAttempted && !competitorCaptureSucceeded) {
+        log(`[moves] ${site.domain}: competitor capture returned no data — SE Ranking /competitors endpoint may be unavailable or no competitors configured. Own-site positions captured successfully.`);
+      }
+
       totalRows += siteRows;
       await logJobComplete(pool, logId, "success", siteRows, null);
       log(`[moves] ${site.domain}: ${siteRows} row(s) written`);
@@ -208,25 +225,25 @@ export async function runBacklinkSnapshot(pool, log) {
       const domain = (site.domain || "").toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "");
       if (!domain) throw new Error("site.domain empty");
 
-      // SE Ranking Data API — /backlinks/domain/{domain}/backlinks returns
-      // the full referring-backlink list with status. We're pulling the
-      // latest state, then diffing against last week's snapshot in SQL to
-      // label new/lost.
-      const blRaw = await dataApi("GET", `/backlinks/domain/${encodeURIComponent(domain)}/backlinks?limit=500`);
-      if (!blRaw.ok) {
-        // Fall back to overview-only endpoint if backlink detail endpoint
-        // isn't available on this plan — still records a snapshot row.
-        const ovRaw = await dataApi("GET", `/backlinks/domain/${encodeURIComponent(domain)}/summary`);
-        if (!ovRaw.ok) throw new Error(`Data API backlinks unavailable: ${blRaw.status} / ${ovRaw.status}`);
-        log(`[backlinks] ${site.domain}: detail unavailable, summary-only captured`);
-        await logJobComplete(pool, logId, "success", 0, null);
-        continue;
+      // SE Ranking Data API backlinks — working endpoints confirmed 2026-04-19:
+      //   /backlinks/refdomains?target=X&mode=domain   → list of referring domains
+      //   /backlinks/summary?target=X                  → aggregate totals
+      //
+      // We diff referring-domain sets across snapshots to label new/lost.
+      const refDomainsRaw = await dataApi("GET", `/backlinks/refdomains?target=${encodeURIComponent(domain)}&mode=domain`);
+      if (!refDomainsRaw.ok) {
+        throw new Error(`Data API /backlinks/refdomains failed: HTTP ${refDomainsRaw.status} ${refDomainsRaw.errorText || ""}`);
       }
 
-      const backlinks = Array.isArray(blRaw.data?.backlinks) ? blRaw.data.backlinks : Array.isArray(blRaw.data) ? blRaw.data : [];
+      const refdomains = Array.isArray(refDomainsRaw.data?.refdomains)
+        ? refDomainsRaw.data.refdomains
+        : Array.isArray(refDomainsRaw.data)
+          ? refDomainsRaw.data
+          : [];
+
       const snapshotDate = new Date().toISOString().split("T")[0];
 
-      // Pull last known active backlinks for this site to diff against
+      // Pull last known active referring domains to diff against
       const lastActive = await pool.request()
         .input("siteId", sql.UniqueIdentifier, site.site_id)
         .query(`
@@ -238,26 +255,28 @@ export async function runBacklinkSnapshot(pool, log) {
       const previousDomains = new Set(lastActive.recordset.map((r) => r.referring_domain));
       const currentDomains = new Set();
 
-      for (const bl of backlinks) {
-        const refDomain = String(bl.referring_domain || bl.source_domain || "").toLowerCase().slice(0, 299);
+      for (const rd of refdomains) {
+        const refDomain = String(rd.refdomain || rd.referring_domain || "").toLowerCase().slice(0, 299);
         if (!refDomain) continue;
         currentDomains.add(refDomain);
         const isNew = !previousDomains.has(refDomain);
+        const da = Number(rd.domain_inlink_rank || rd.domain_trust || rd.domain_authority || rd.da || 0) || null;
+        const firstSeen = rd.first_seen ? new Date(rd.first_seen).toISOString().split("T")[0] : null;
+        const lastSeen = rd.last_seen ? new Date(rd.last_seen).toISOString().split("T")[0] : snapshotDate;
+
         await pool.request()
           .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
           .input("siteId", sql.UniqueIdentifier, site.site_id)
           .input("refDomain", sql.NVarChar(300), refDomain)
-          .input("targetUrl", sql.NVarChar(1000), String(bl.target_url || bl.target || "").slice(0, 999) || null)
-          .input("anchor", sql.NVarChar(500), String(bl.anchor || bl.anchor_text || "").slice(0, 499) || null)
-          .input("da", sql.Int, Number(bl.domain_trust || bl.domain_authority || bl.da || 0) || null)
+          .input("da", sql.Int, da)
           .input("status", sql.NVarChar(20), isNew ? "new" : "active")
-          .input("firstSeen", sql.Date, bl.first_seen ? new Date(bl.first_seen).toISOString().split("T")[0] : null)
-          .input("lastSeen", sql.Date, bl.last_seen ? new Date(bl.last_seen).toISOString().split("T")[0] : snapshotDate)
+          .input("firstSeen", sql.Date, firstSeen)
+          .input("lastSeen", sql.Date, lastSeen)
           .input("snapshotDate", sql.Date, snapshotDate)
           .query(`
             INSERT INTO arion.se_ranking_backlink_snapshot
-              (tenant_id, site_id, referring_domain, target_url, anchor_text, domain_authority, link_status, first_seen, last_seen, snapshot_date)
-            VALUES (@tenantId, @siteId, @refDomain, @targetUrl, @anchor, @da, @status, @firstSeen, @lastSeen, @snapshotDate)
+              (tenant_id, site_id, referring_domain, domain_authority, link_status, first_seen, last_seen, snapshot_date)
+            VALUES (@tenantId, @siteId, @refDomain, @da, @status, @firstSeen, @lastSeen, @snapshotDate)
           `);
         siteRows++;
       }
@@ -277,6 +296,17 @@ export async function runBacklinkSnapshot(pool, log) {
             VALUES (@tenantId, @siteId, @refDomain, @status, @snapshotDate)
           `);
         siteRows++;
+      }
+
+      // Also fetch the summary for the totals record (once per run — optional)
+      try {
+        const sumRaw = await dataApi("GET", `/backlinks/summary?target=${encodeURIComponent(domain)}`);
+        if (sumRaw.ok) {
+          const s = Array.isArray(sumRaw.data?.summary) ? sumRaw.data.summary[0] : null;
+          if (s) log(`[backlinks] ${site.domain}: summary — ${s.backlinks || 0} total backlinks, ${s.refdomains || 0} refdomains`);
+        }
+      } catch (e) {
+        // summary is informational only — don't fail the job on this
       }
 
       totalRows += siteRows;
