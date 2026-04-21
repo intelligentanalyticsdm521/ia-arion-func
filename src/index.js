@@ -7,3 +7,5 @@ import "./functions/manualReconcile.js";
 import "./functions/marketMonitorMoves.js";
 import "./functions/marketMonitorBacklinks.js";
 import "./functions/marketMonitorPageChanges.js";
+// IA Plugin snapshot — nightly pull of site health/security/performance data
+import "./functions/pluginSnapshot.js";
