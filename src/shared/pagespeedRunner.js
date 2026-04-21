@@ -170,11 +170,26 @@ async function persistSnapshot(pool, tenantId, siteId, result, triggeredBy) {
     `);
 }
 
+/**
+ * Per-plan PSI cadence:
+ *   Starter  → every 90 days (quarterly)
+ *   Essentials / Growth / Authority → every 30 days (monthly)
+ *
+ * The timer fires monthly (1st) and for each site checks if it's due based
+ * on its plan + last-run date. Sites that ran within their cadence window
+ * are skipped to avoid wasted PSI quota.
+ */
+function cadenceDaysForTier(tier) {
+  const t = String(tier || "").toLowerCase();
+  if (t === "starter" || t === "lite") return 90;
+  return 30;
+}
+
 export async function runMonthlyPageSpeed(pool, log) {
-  const out = { sitesProcessed: 0, snapshotsWritten: 0, errors: [] };
+  const out = { sitesProcessed: 0, sitesSkipped: 0, snapshotsWritten: 0, errors: [] };
 
   const sitesRes = await pool.request().query(`
-    SELECT s.site_id, s.tenant_id, s.domain
+    SELECT s.site_id, s.tenant_id, s.domain, s.arion_tier
     FROM arion.site s
     WHERE s.domain IS NOT NULL AND s.domain <> ''
   `);
@@ -182,19 +197,40 @@ export async function runMonthlyPageSpeed(pool, log) {
   log(`found ${sites.length} site(s)`);
 
   for (const site of sites) {
+    const cadence = cadenceDaysForTier(site.arion_tier);
+
+    // Check last run_date for this site — skip if within cadence window
+    try {
+      const lastRun = await pool.request()
+        .input("siteId", site.site_id)
+        .query(`SELECT TOP 1 run_date FROM arion.site_pagespeed_snapshot WHERE site_id = @siteId AND triggered_by IN ('monthly','quarterly') ORDER BY run_date DESC`);
+      const lastRunDate = lastRun.recordset?.[0]?.run_date;
+      if (lastRunDate) {
+        const daysSince = (Date.now() - new Date(lastRunDate).getTime()) / 86400000;
+        if (daysSince < cadence - 2) {
+          // -2 day fudge so a 30-day plan run on the 1st of consecutive months isn't skipped
+          out.sitesSkipped++;
+          log(`${site.domain} skipped (tier=${site.arion_tier || "—"}, cadence=${cadence}d, last=${Math.round(daysSince)}d ago)`);
+          continue;
+        }
+      }
+    } catch (e) {
+      log(`${site.domain} cadence check failed: ${e.message}`);
+    }
+
     out.sitesProcessed++;
+    const triggeredBy = cadence >= 90 ? "quarterly" : "monthly";
     const url = "https://" + String(site.domain).replace(/^https?:\/\//, "").replace(/\/$/, "");
     for (const strategy of ["mobile", "desktop"]) {
       try {
         const result = await runPSI(url, strategy);
-        await persistSnapshot(pool, site.tenant_id, site.site_id, result, "monthly");
+        await persistSnapshot(pool, site.tenant_id, site.site_id, result, triggeredBy);
         out.snapshotsWritten++;
-        log(`${site.domain} ${strategy}: ${result.scores?.performance ?? "?"}`);
+        log(`${site.domain} ${strategy} (${triggeredBy}): ${result.scores?.performance ?? "?"}`);
       } catch (err) {
         out.errors.push({ site_id: site.site_id, strategy, message: err.message });
         log(`${site.domain} ${strategy} FAILED: ${err.message}`);
       }
-      // Small delay between runs to avoid quota spikes
       await new Promise((r) => setTimeout(r, 2500));
     }
   }
