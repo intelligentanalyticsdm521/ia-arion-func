@@ -172,8 +172,8 @@ async function persistSnapshot(pool, tenantId, siteId, result, triggeredBy) {
 
 /**
  * Per-plan PSI cadence:
- *   Starter  → every 90 days (quarterly)
- *   Essentials / Growth / Authority → every 30 days (monthly)
+ *   Starter / Essentials / Lite → every 90 days (quarterly)
+ *   Growth / Authority / Business → every 30 days (monthly)
  *
  * The timer fires monthly (1st) and for each site checks if it's due based
  * on its plan + last-run date. Sites that ran within their cadence window
@@ -181,8 +181,9 @@ async function persistSnapshot(pool, tenantId, siteId, result, triggeredBy) {
  */
 function cadenceDaysForTier(tier) {
   const t = String(tier || "").toLowerCase();
-  if (t === "starter" || t === "lite") return 90;
-  return 30;
+  if (t === "starter" || t === "essentials" || t === "lite" || t === "standard" || t === "pro") return 90;
+  if (t === "growth" || t === "authority" || t === "business" || t === "enterprise") return 30;
+  return 90; // safe default for unknown tiers
 }
 
 export async function runMonthlyPageSpeed(pool, log) {
