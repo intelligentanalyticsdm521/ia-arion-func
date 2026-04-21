@@ -9,3 +9,5 @@ import "./functions/marketMonitorBacklinks.js";
 import "./functions/marketMonitorPageChanges.js";
 // IA Plugin snapshot — nightly pull of site health/security/performance data
 import "./functions/pluginSnapshot.js";
+// Monthly PageSpeed — 1st of month, captures CrUX + Lighthouse opportunities
+import "./functions/monthlyPageSpeed.js";

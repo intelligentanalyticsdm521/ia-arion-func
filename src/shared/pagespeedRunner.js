@@ -1,0 +1,203 @@
+/**
+ * Monthly PageSpeed runner — runs Google PageSpeed Insights for every active
+ * ARION site (mobile + desktop) and persists the snapshot to
+ * arion.site_pagespeed_snapshot.
+ *
+ * This is the CrUX + Opportunities-aware version that matches the v2.0.7
+ * plugin + arion-api rebuild. Called by the monthlyPageSpeed.js timer.
+ */
+import sql from "mssql";
+
+const PSI_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
+const REQUEST_TIMEOUT_MS = 45_000;
+
+function extractOpportunities(audits, limit = 8) {
+  const keys = [
+    "render-blocking-resources",
+    "unused-css-rules",
+    "unused-javascript",
+    "modern-image-formats",
+    "uses-responsive-images",
+    "efficient-animated-content",
+    "offscreen-images",
+    "total-byte-weight",
+    "uses-long-cache-ttl",
+    "uses-optimized-images",
+    "uses-text-compression",
+    "server-response-time",
+    "redirects",
+    "font-display",
+    "critical-request-chains",
+    "dom-size",
+  ];
+  const out = [];
+  for (const k of keys) {
+    const a = audits?.[k];
+    if (!a) continue;
+    if (a.score != null && a.score >= 0.9) continue;
+    out.push({
+      id: k,
+      title: a.title || k,
+      display_value: a.displayValue || null,
+      numeric_value: a.numericValue ?? null,
+      numeric_unit: a.numericUnit || null,
+      score: a.score ?? null,
+    });
+  }
+  out.sort((a, b) => (b.numeric_value ?? -1) - (a.numeric_value ?? -1));
+  return out.slice(0, limit);
+}
+
+function extractCrux(experience) {
+  if (!experience?.metrics) return null;
+  const m = experience.metrics;
+  const pluck = (key) => {
+    const v = m[key];
+    if (!v) return null;
+    return {
+      percentile: v.percentile ?? null,
+      category: v.category ?? null,
+      distributions: v.distributions ?? null,
+    };
+  };
+  return {
+    overall_category: experience.overall_category ?? null,
+    origin_fallback: experience.origin_fallback ?? null,
+    lcp: pluck("LARGEST_CONTENTFUL_PAINT_MS"),
+    inp: pluck("INTERACTION_TO_NEXT_PAINT"),
+    cls: pluck("CUMULATIVE_LAYOUT_SHIFT_SCORE"),
+    fcp: pluck("FIRST_CONTENTFUL_PAINT_MS"),
+    ttfb: pluck("EXPERIMENTAL_TIME_TO_FIRST_BYTE"),
+  };
+}
+
+async function runPSI(url, strategy) {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  const params = new URLSearchParams({ url, strategy });
+  params.append("category", "performance");
+  params.append("category", "accessibility");
+  params.append("category", "seo");
+  params.append("category", "best-practices");
+  if (apiKey) params.set("key", apiKey);
+
+  const fetchUrl = `${PSI_BASE}?${params.toString()}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(fetchUrl, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const cats = data.lighthouseResult?.categories || {};
+    const audits = data.lighthouseResult?.audits || {};
+    const scoreOf = (c) => (c?.score != null ? Math.round(c.score * 100) : null);
+    const metricOf = (k) => {
+      const a = audits[k];
+      return a ? { value: a.numericValue ?? null, display: a.displayValue ?? null } : { value: null, display: null };
+    };
+    return {
+      strategy,
+      url,
+      scores: {
+        performance: scoreOf(cats.performance),
+        accessibility: scoreOf(cats.accessibility),
+        seo: scoreOf(cats.seo),
+        bestPractices: scoreOf(cats["best-practices"]),
+      },
+      metrics: {
+        lcp: metricOf("largest-contentful-paint"),
+        cls: metricOf("cumulative-layout-shift"),
+        inp: metricOf("interaction-to-next-paint"),
+        fcp: metricOf("first-contentful-paint"),
+        si: metricOf("speed-index"),
+        tbt: metricOf("total-blocking-time"),
+      },
+      field_url: extractCrux(data.loadingExperience),
+      field_origin: extractCrux(data.originLoadingExperience),
+      opportunities: extractOpportunities(audits),
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+async function persistSnapshot(pool, tenantId, siteId, result, triggeredBy) {
+  const today = new Date().toISOString().slice(0, 10);
+  const m = result.metrics || {};
+  await pool.request()
+    .input("tenantId", sql.UniqueIdentifier, tenantId)
+    .input("siteId", sql.UniqueIdentifier, siteId)
+    .input("runDate", sql.Date, today)
+    .input("strategy", sql.NVarChar(10), result.strategy)
+    .query(`DELETE FROM arion.site_pagespeed_snapshot
+            WHERE tenant_id=@tenantId AND site_id=@siteId AND run_date=@runDate AND strategy=@strategy`);
+
+  await pool.request()
+    .input("tenantId", sql.UniqueIdentifier, tenantId)
+    .input("siteId", sql.UniqueIdentifier, siteId)
+    .input("runDate", sql.Date, today)
+    .input("strategy", sql.NVarChar(10), result.strategy)
+    .input("performanceScore", sql.Int, result.scores?.performance ?? null)
+    .input("accessibilityScore", sql.Int, result.scores?.accessibility ?? null)
+    .input("seoScore", sql.Int, result.scores?.seo ?? null)
+    .input("bestPracticesScore", sql.Int, result.scores?.bestPractices ?? null)
+    .input("mobilePerformance", sql.Int, result.strategy === "mobile" ? result.scores?.performance ?? null : null)
+    .input("desktopPerformance", sql.Int, result.strategy === "desktop" ? result.scores?.performance ?? null : null)
+    .input("lcpMs", sql.Int, Math.round(m.lcp?.value ?? 0) || null)
+    .input("inpMs", sql.Int, Math.round(m.inp?.value ?? 0) || null)
+    .input("clsScore", sql.Decimal(6, 4), m.cls?.value != null ? Number(m.cls.value).toFixed(4) : null)
+    .input("fcpMs", sql.Int, Math.round(m.fcp?.value ?? 0) || null)
+    .input("tbtMs", sql.Int, Math.round(m.tbt?.value ?? 0) || null)
+    .input("opportunities", sql.NVarChar(sql.MAX), JSON.stringify(result.opportunities || []))
+    .input("cruxUrl", sql.NVarChar(sql.MAX), result.field_url ? JSON.stringify(result.field_url) : null)
+    .input("cruxOrigin", sql.NVarChar(sql.MAX), result.field_origin ? JSON.stringify(result.field_origin) : null)
+    .input("triggeredBy", sql.NVarChar(50), triggeredBy || "monthly")
+    .query(`
+      INSERT INTO arion.site_pagespeed_snapshot
+        (tenant_id, site_id, run_date, strategy,
+         performance_score, accessibility_score, seo_score, best_practices_score,
+         mobile_performance, desktop_performance,
+         lcp_ms, inp_ms, cls_score, fcp_ms, tbt_ms,
+         opportunities, crux_url_json, crux_origin_json, triggered_by)
+      VALUES (@tenantId, @siteId, @runDate, @strategy,
+              @performanceScore, @accessibilityScore, @seoScore, @bestPracticesScore,
+              @mobilePerformance, @desktopPerformance,
+              @lcpMs, @inpMs, @clsScore, @fcpMs, @tbtMs,
+              @opportunities, @cruxUrl, @cruxOrigin, @triggeredBy)
+    `);
+}
+
+export async function runMonthlyPageSpeed(pool, log) {
+  const out = { sitesProcessed: 0, snapshotsWritten: 0, errors: [] };
+
+  const sitesRes = await pool.request().query(`
+    SELECT s.site_id, s.tenant_id, s.domain
+    FROM arion.site s
+    WHERE s.domain IS NOT NULL AND s.domain <> ''
+  `);
+  const sites = sitesRes.recordset || [];
+  log(`found ${sites.length} site(s)`);
+
+  for (const site of sites) {
+    out.sitesProcessed++;
+    const url = "https://" + String(site.domain).replace(/^https?:\/\//, "").replace(/\/$/, "");
+    for (const strategy of ["mobile", "desktop"]) {
+      try {
+        const result = await runPSI(url, strategy);
+        await persistSnapshot(pool, site.tenant_id, site.site_id, result, "monthly");
+        out.snapshotsWritten++;
+        log(`${site.domain} ${strategy}: ${result.scores?.performance ?? "?"}`);
+      } catch (err) {
+        out.errors.push({ site_id: site.site_id, strategy, message: err.message });
+        log(`${site.domain} ${strategy} FAILED: ${err.message}`);
+      }
+      // Small delay between runs to avoid quota spikes
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+  }
+
+  return out;
+}
