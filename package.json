@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "@azure/functions": "^4.6.0",
-    "@azure/identity": "^4.13.0",
+    "@azure/identity": "^4.13.1",
+    "@azure/keyvault-secrets": "^4.11.2",
     "dotenv": "^16.4.5",
     "mssql": "^10.0.4"
   },

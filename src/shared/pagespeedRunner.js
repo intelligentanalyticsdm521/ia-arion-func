@@ -7,6 +7,7 @@
  * plugin + arion-api rebuild. Called by the monthlyPageSpeed.js timer.
  */
 import sql from "mssql";
+import { getSecret } from "./secrets.js";
 
 const PSI_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const REQUEST_TIMEOUT_MS = 45_000;
@@ -72,7 +73,8 @@ function extractCrux(experience) {
 }
 
 async function runPSI(url, strategy) {
-  const apiKey = process.env.GOOGLE_API_KEY;
+  // v2.0.12 — load from Key Vault if env var not set
+  const apiKey = await getSecret('GOOGLE_API_KEY', 'arion-google-psi-key');
   const params = new URLSearchParams({ url, strategy });
   params.append("category", "performance");
   params.append("category", "accessibility");
