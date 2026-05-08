@@ -74,7 +74,7 @@ function extractCrux(experience) {
 
 async function runPSI(url, strategy) {
   // v2.0.12 — load from Key Vault if env var not set
-  const apiKey = await getSecret('GOOGLE_API_KEY', 'arion-google-psi-key');
+  const apiKey = await getSecret('GOOGLE_API_KEY', 'GOOGLE-PAGESPEED-API-KEY');
   const params = new URLSearchParams({ url, strategy });
   params.append("category", "performance");
   params.append("category", "accessibility");
