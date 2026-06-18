@@ -15,16 +15,33 @@
 const PROJECT_BASE = process.env.SERANKING_PROJECT_API_BASE || "https://api4.seranking.com";
 const DATA_BASE    = process.env.SERANKING_DATA_API_BASE    || "https://api.seranking.com/v1";
 
+// Mirror arion-api/lib/seranking.js fallback logic (commit 03fce94 2026-06-17).
+// Key Vault has been seen with either underscores or dashes; accept both so
+// timer functions don't silently fail when the secret name shape changes.
+const PROJECT_KEY =
+  process.env.SERANKING_API_SYSTEM_KEY
+  || process.env["SE-RANKING-API-SYSTEM-KEY"]
+  || process.env["SE-RANKING-API-KEY"]
+  || process.env.SE_RANKING_API_KEY;
+
+const DATA_KEY =
+  process.env.SERANKING_DATA_API_KEY
+  || process.env["SE-RANKING-DATA-API-KEY"]
+  || process.env.SE_RANKING_DATA_API_KEY
+  // Last-resort fallback: arion-api uses the project key against v1 if no v1
+  // key is set. This MAY 401 (different host enforces different key) but
+  // surfaces a clear "401" instead of "key not configured" so the failure is
+  // actionable in logs.
+  || PROJECT_KEY;
+
 function projectHeaders() {
-  const key = process.env.SERANKING_API_SYSTEM_KEY;
-  if (!key) return null;
-  return { "Authorization": `Token ${key}`, "Content-Type": "application/json" };
+  if (!PROJECT_KEY) return null;
+  return { "Authorization": `Token ${PROJECT_KEY}`, "Content-Type": "application/json" };
 }
 
 function dataHeaders() {
-  const key = process.env.SERANKING_DATA_API_KEY;
-  if (!key) return null;
-  return { "Authorization": `Token ${key}`, "Content-Type": "application/json" };
+  if (!DATA_KEY) return null;
+  return { "Authorization": `Token ${DATA_KEY}`, "Content-Type": "application/json" };
 }
 
 async function doRequest(url, method, headers, body) {
