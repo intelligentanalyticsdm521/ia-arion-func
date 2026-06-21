@@ -19,3 +19,5 @@ import "./functions/leadgenScheduledRuns.js";
 import "./functions/leadgenWeeklyDigest.js";
 // F-LG.15 followup — nightly TTL purge of lumen.domain_check_cache (04:23 UTC)
 import "./functions/domainCheckCacheCleanup.js";
+// AI Website Builder followup — nightly TTL purge of arion.site_block_draft (04:47 UTC)
+import "./functions/siteBlockDraftCleanup.js";
