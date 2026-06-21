@@ -11,3 +11,5 @@ import "./functions/marketMonitorPageChanges.js";
 import "./functions/pluginSnapshot.js";
 // Monthly PageSpeed — 1st of month, captures CrUX + Lighthouse opportunities
 import "./functions/monthlyPageSpeed.js";
+// ARGUS Auto-Topoff — every 15 min, auto-refills credits via Stripe
+import "./functions/argusAutotopoffCharger.js";
