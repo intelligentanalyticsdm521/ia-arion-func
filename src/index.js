@@ -15,3 +15,5 @@ import "./functions/monthlyPageSpeed.js";
 import "./functions/argusAutotopoffCharger.js";
 // F-LG.6 Lead Gen scheduled runs — every 30 min, dispatches scheduled search profiles
 import "./functions/leadgenScheduledRuns.js";
+// F-LG.6.4 Lead Gen weekly digest — Mondays 07:00 UTC, emails prior-week summary
+import "./functions/leadgenWeeklyDigest.js";
