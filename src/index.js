@@ -17,3 +17,5 @@ import "./functions/argusAutotopoffCharger.js";
 import "./functions/leadgenScheduledRuns.js";
 // F-LG.6.4 Lead Gen weekly digest — Mondays 07:00 UTC, emails prior-week summary
 import "./functions/leadgenWeeklyDigest.js";
+// F-LG.15 followup — nightly TTL purge of lumen.domain_check_cache (04:23 UTC)
+import "./functions/domainCheckCacheCleanup.js";
