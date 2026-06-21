@@ -13,3 +13,5 @@ import "./functions/pluginSnapshot.js";
 import "./functions/monthlyPageSpeed.js";
 // ARGUS Auto-Topoff — every 15 min, auto-refills credits via Stripe
 import "./functions/argusAutotopoffCharger.js";
+// F-LG.6 Lead Gen scheduled runs — every 30 min, dispatches scheduled search profiles
+import "./functions/leadgenScheduledRuns.js";
