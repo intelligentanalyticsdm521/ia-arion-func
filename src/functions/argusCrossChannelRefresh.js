@@ -3,10 +3,11 @@ import sql from "mssql";
 import { getServicesPool } from "../shared/servicesPool.js";
 
 /**
- * ARGUS Cross-Channel Intelligence — daily cache sweep.
+ * ARGUS Cross-Platform Intelligence — daily cache sweep.
  *
- * Per Brandon's locked Insights hierarchy (2026-06-20), the 6 cross-channel
- * reports live in argus.cross_channel_cache (oliver-api migration 098).
+ * Per Brandon's locked Insights hierarchy (2026-06-20), the 6 cross-platform
+ * reports live in argus.cross_channel_cache (oliver-api migration 098 —
+ * DB table name preserved for back-compat; concept renamed 2026-06-22).
  * The platform-api routes use lazy refresh — recompute when a user GETs a
  * report whose cache is > 12h old.
  *
@@ -22,7 +23,8 @@ import { getServicesPool } from "../shared/servicesPool.js";
  *
  * Pre-warming uses an internal callback URL pattern: we don't import
  * platform-api directly (different repo), so we hit
- *   GET ${PLATFORM_API_URL}/argus/cross-channel-intelligence/{tenantId}/reports?refresh=true
+ *   GET ${PLATFORM_API_URL}/argus/cross-platform-intelligence/{tenantId}/reports?refresh=true
+ *   (legacy alias /argus/cross-channel-intelligence/* also accepted by platform-api)
  * for each Pro+ tenant. The function-app's managed identity must be
  * granted access to platform-api (already wired for the autotopoff timer).
  *
@@ -112,12 +114,12 @@ app.timer("argusCrossChannelRefresh", {
       // individual tenant errors.
       for (const tenantId of candidates) {
         try {
-          const url = `${platformApiUrl}/argus/cross-channel-intelligence/${encodeURIComponent(tenantId)}/reports?refresh=true`;
+          const url = `${platformApiUrl}/argus/cross-platform-intelligence/${encodeURIComponent(tenantId)}/reports?refresh=true`;
           const resp = await fetch(url, {
             method: "GET",
             headers: {
               "x-tenant-key": tenantId,
-              "x-internal-refresh": "argus-cross-channel-timer",
+              "x-internal-refresh": "argus-cross-platform-timer",
             },
           });
           if (resp.ok) summary.pre_warmed++;
