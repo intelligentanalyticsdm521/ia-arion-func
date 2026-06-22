@@ -21,3 +21,11 @@ import "./functions/leadgenWeeklyDigest.js";
 import "./functions/domainCheckCacheCleanup.js";
 // AI Website Builder followup — nightly TTL purge of arion.site_block_draft (04:47 UTC)
 import "./functions/siteBlockDraftCleanup.js";
+// My Brand > Social post dispatcher — every 5 min. Polls LUMEN-API for
+// posts where status='scheduled' AND scheduled_for<=now, publishes to
+// FB/IG/X/LinkedIn, PATCHes per-target results back.
+import "./functions/socialPostDispatcher.js";
+// My Brand > Social Analytics fetcher — daily 05:43 UTC. Pulls per-post +
+// per-account metrics from FB/IG/X/LinkedIn into lumen.social_post_metric +
+// lumen.social_account_metric via LUMEN-API internal endpoints.
+import "./functions/socialAnalyticsFetcher.js";
