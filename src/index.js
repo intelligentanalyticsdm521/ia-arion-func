@@ -21,6 +21,8 @@ import "./functions/leadgenWeeklyDigest.js";
 import "./functions/domainCheckCacheCleanup.js";
 // AI Website Builder followup — nightly TTL purge of arion.site_block_draft (04:47 UTC)
 import "./functions/siteBlockDraftCleanup.js";
+// Wave 3 (2026-06-22) — My Brand Voice Monitor: nightly WP page brand-voice scan (05:55 UTC)
+import "./functions/arionPageVoiceScore.js";
 // My Brand > Social post dispatcher — every 5 min. Polls LUMEN-API for
 // posts where status='scheduled' AND scheduled_for<=now, publishes to
 // FB/IG/X/LinkedIn, PATCHes per-target results back.
