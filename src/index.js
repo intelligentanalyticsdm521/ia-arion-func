@@ -31,3 +31,10 @@ import "./functions/socialPostDispatcher.js";
 // per-account metrics from FB/IG/X/LinkedIn into lumen.social_post_metric +
 // lumen.social_account_metric via LUMEN-API internal endpoints.
 import "./functions/socialAnalyticsFetcher.js";
+// Onboarding Runner Worker — every 30s. Subscribes to stuck arion.site rows
+// (status_phase in installing_plugins/creating_editor_user/configuring_seo/
+// connecting_google/connecting_bing + pending_user_*_oauth) and advances
+// them through the post-checkout phase machine the Portal-side
+// OnboardingRunner polls. Without this, Portal sites stick on
+// "Installing your tools" forever.
+import "./functions/onboardingRunnerWorker.js";
