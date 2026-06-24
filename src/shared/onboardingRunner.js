@@ -295,6 +295,12 @@ async function advanceConnectingBing(pool, row, { log, fetchImpl }) {
   //                            AddSite API and then invites the customer.
   //                            Triggered by POSTing to the existing
   //                            arion-api auto-connect endpoint.
+  //
+  // Graceful-skip: if arion-api returns 503 because BING-WMT-API-KEY is not
+  // yet configured in KV, we DON'T stall the whole site at connecting_bing.
+  // The site advances straight to ready and we note the soft-skip in
+  // provisioning_details_json so the founder dashboard surfaces it.
+  // (See poolCalculator + Bing graceful-skip locked 2026-06-24.)
   const mode = (row.bing_setup_mode || "").toLowerCase();
   const isIaManaged = mode === "ia_managed" || mode === "auto_ia";
   if (isIaManaged) {
@@ -305,6 +311,16 @@ async function advanceConnectingBing(pool, row, { log, fetchImpl }) {
     });
     if (resp.deferred) return "deferred";
     if (!resp.ok) {
+      const errMsg = resp.error?.message || "";
+      const isMissingKey = /BING-WMT-API-KEY.*not.*configured|api.*key.*missing/i.test(errMsg)
+        || resp.status === 503;
+      if (isMissingKey) {
+        log(`bing-auto-connect soft-skip for site_id=${row.site_id}: master key not configured — advancing to ready`);
+        await noteSoftSkip(pool, row.site_id, "bing_auto_connect_skipped", errMsg || "BING-WMT-API-KEY not configured");
+        const won = await transitionToReady(pool, row.site_id, "connecting_bing");
+        if (won) log(`advanced site_id=${row.site_id} connecting_bing → ready (bing soft-skipped)`);
+        return won ? "advanced" : "skipped";
+      }
       await markFailed(pool, row.site_id, "connecting_bing", resp.error, { retryable: resp.retryable });
       return "failed";
     }
@@ -315,6 +331,32 @@ async function advanceConnectingBing(pool, row, { log, fetchImpl }) {
   const won = await transitionPhase(pool, row.site_id, "connecting_bing", "pending_user_bing_oauth");
   if (won) log(`advanced site_id=${row.site_id} connecting_bing → pending_user_bing_oauth`);
   return won ? "advanced" : "skipped";
+}
+
+async function noteSoftSkip(pool, siteId, key, message) {
+  // Records a soft-skip reason in provisioning_details_json without marking
+  // the row failed. Founder dashboard can surface these as "manual follow-up".
+  try {
+    await pool.request()
+      .input("sid", sql.UniqueIdentifier, siteId)
+      .input("key", sql.NVarChar(60), key)
+      .input("message", sql.NVarChar(500), (message || "").slice(0, 500))
+      .query(`
+        UPDATE arion.site
+           SET provisioning_details_json = JSON_MODIFY(
+                 JSON_MODIFY(
+                   COALESCE(provisioning_details_json, '{}'),
+                   '$.soft_skips.' + @key, @message
+                 ),
+                 '$.soft_skips_present', CAST(1 AS bit)
+               ),
+               updated_at = SYSDATETIMEOFFSET()
+         WHERE site_id = @sid
+      `);
+  } catch (e) {
+    // Soft-skip note is best-effort — don't let it block the phase advance.
+    console.warn(`[runner:noteSoftSkip] warn site_id=${siteId} key=${key}: ${e.message}`);
+  }
 }
 
 async function advancePendingBingOauth(pool, row, { log }) {
@@ -439,10 +481,12 @@ async function callArionAdvance(fetchImpl, kind, body) {
   try { parsed = await resp.json(); } catch { /* non-JSON */ }
   if (!resp.ok) {
     const message = parsed?.error?.message || `arion-api advance/${kind} returned ${resp.status}`;
-    const retryable = resp.status >= 500 || resp.status === 429;
-    return { ok: false, error: new Error(message), retryable, deferred: false };
+    // 503 is "service/secret not configured" — treat as non-retryable so callers
+    // can choose to soft-skip (see advanceConnectingBing). 5xx and 429 stay retryable.
+    const retryable = resp.status === 503 ? false : (resp.status >= 500 || resp.status === 429);
+    return { ok: false, error: new Error(message), retryable, status: resp.status, deferred: false };
   }
-  return { ok: true, data: parsed?.data || null, deferred: false };
+  return { ok: true, data: parsed?.data || null, status: resp.status, deferred: false };
 }
 
 /* -------------------------------------------------------------------------
