@@ -74,6 +74,7 @@ export async function pullPluginData(site) {
     users: "/security/users",
     litespeed: "/performance/litespeed",
     shortpixel: "/performance/shortpixel",
+    ewww: "/performance/ewww",
     server: "/performance/server",
     cron: "/performance/cron",
     contentSummary: "/content/summary",
@@ -98,6 +99,7 @@ function buildSnapshotRow(siteRow, pulled) {
   const ch = pulled.coreHealth?.data || {};
   const ls = pulled.litespeed?.data || {};
   const sp = pulled.shortpixel?.data || {};
+  const ew = pulled.ewww?.data || {};
   const th = pulled.theme?.data || {};
   const upd = pulled.updates?.data || {};
   const cs = pulled.contentSummary?.data || {};
@@ -124,6 +126,7 @@ function buildSnapshotRow(siteRow, pulled) {
     litespeed_active: ls.installed === true ? 1 : ls.installed === false ? 0 : null,
     litespeed_opt_score: ls.optimization_score ?? null,
     shortpixel_active: sp.installed === true ? 1 : sp.installed === false ? 0 : null,
+    ewww_active: ew.installed === true ? 1 : ew.installed === false ? 0 : null,
     posts_published: cs.posts_published ?? null,
     pages_published: cs.pages_published ?? null,
     media_count: cs.media_count ?? null,
@@ -183,6 +186,7 @@ export async function snapshotSite(pool, site, log = () => {}) {
     .input("litespeedActive", sql.Bit, row.litespeed_active)
     .input("litespeedOptScore", sql.Int, row.litespeed_opt_score)
     .input("shortpixelActive", sql.Bit, row.shortpixel_active)
+    .input("ewwwActive", sql.Bit, row.ewww_active)
     .input("postsPublished", sql.Int, row.posts_published)
     .input("pagesPublished", sql.Int, row.pages_published)
     .input("mediaCount", sql.Int, row.media_count)
@@ -213,6 +217,7 @@ export async function snapshotSite(pool, site, log = () => {}) {
         litespeed_active = @litespeedActive,
         litespeed_opt_score = @litespeedOptScore,
         shortpixel_active = @shortpixelActive,
+        ewww_active = @ewwwActive,
         posts_published = @postsPublished,
         pages_published = @pagesPublished,
         media_count = @mediaCount,
@@ -225,14 +230,14 @@ export async function snapshotSite(pool, site, log = () => {}) {
          theme_name, theme_version, plugins_total, plugins_active, plugins_update_available,
          theme_update_available, core_update_available, wordfence_active, wordfence_firewall_on,
          wordfence_last_scan_at, wordfence_blocked_24h, core_health_critical, core_health_recommended,
-         litespeed_active, litespeed_opt_score, shortpixel_active, posts_published, pages_published,
+         litespeed_active, litespeed_opt_score, shortpixel_active, ewww_active, posts_published, pages_published,
          media_count, rm_avg_seo_score, rm_posts_missing_meta, payload_json)
       VALUES
         (@tenantId, @siteId, @snapshotDate, @pluginVersion, @wpVersion, @phpVersion,
          @themeName, @themeVersion, @pluginsTotal, @pluginsActive, @pluginsUpdateAvailable,
          @themeUpdateAvailable, @coreUpdateAvailable, @wordfenceActive, @wordfenceFirewallOn,
          @wordfenceLastScanAt, @wordfenceBlocked24h, @coreHealthCritical, @coreHealthRecommended,
-         @litespeedActive, @litespeedOptScore, @shortpixelActive, @postsPublished, @pagesPublished,
+         @litespeedActive, @litespeedOptScore, @shortpixelActive, @ewwwActive, @postsPublished, @pagesPublished,
          @mediaCount, @rmAvgSeoScore, @rmPostsMissingMeta, @payloadJson);
     `);
 
