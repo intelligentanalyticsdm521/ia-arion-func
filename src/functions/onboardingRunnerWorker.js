@@ -37,6 +37,7 @@ import { runOnboardingTick } from "../shared/onboardingRunner.js";
  *   ARION_API_BASE                — base URL for the advance HTTP calls
  *   ARION_INGEST_KEY              — x-arion-ingest-key auth on the advance calls
  *   RUNNER_STUCK_HORIZON_MIN      — max age of stuck rows to consider (default 30)
+ *   RUNNER_USER_OAUTH_HORIZON_MIN — max age of pending_user_*_oauth rows (default 10080 = 7 days)
  *   RUNNER_MAX_ROWS_PER_TICK      — cap per tick (default 10)
  */
 app.timer("onboardingRunnerWorker", {
