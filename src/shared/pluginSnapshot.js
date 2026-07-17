@@ -69,7 +69,9 @@ export async function pullPluginData(site) {
     health: "/health",
     status: "/status",
     plugins: "/plugins",
-    wordfence: "/security/wordfence",
+    // Shield Security data. The IA Plugin serves it via the legacy
+    // /security/wordfence route, which now returns Shield fields.
+    shield: "/security/wordfence",
     coreHealth: "/security/core-health",
     users: "/security/users",
     litespeed: "/performance/litespeed",
@@ -95,7 +97,8 @@ export async function pullPluginData(site) {
  */
 function buildSnapshotRow(siteRow, pulled) {
   const h = pulled.health?.data || {};
-  const wf = pulled.wordfence?.data || {};
+  // Shield Security payload (served via the legacy /security/wordfence route).
+  const shield = pulled.shield?.data || {};
   const ch = pulled.coreHealth?.data || {};
   const ls = pulled.litespeed?.data || {};
   const sp = pulled.shortpixel?.data || {};
@@ -117,10 +120,12 @@ function buildSnapshotRow(siteRow, pulled) {
     plugins_update_available: upd.plugin_update_count ?? null,
     theme_update_available: upd.theme_update_count > 0 ? 1 : 0,
     core_update_available: upd.core_update ? 1 : 0,
-    wordfence_active: wf.installed === true ? 1 : wf.installed === false ? 0 : null,
-    wordfence_firewall_on: wf.firewall_enabled === true ? 1 : wf.firewall_enabled === false ? 0 : null,
-    wordfence_last_scan_at: wf.last_scan_at || null,
-    wordfence_blocked_24h: wf.blocked_attacks_24h ?? null,
+    // Shield Security metrics. DB columns keep the legacy wordfence_* names
+    // (renaming requires a migration — out of scope) but carry Shield data.
+    wordfence_active: shield.installed === true ? 1 : shield.installed === false ? 0 : null,
+    wordfence_firewall_on: shield.firewall_enabled === true ? 1 : shield.firewall_enabled === false ? 0 : null,
+    wordfence_last_scan_at: shield.last_scan_at || null,
+    wordfence_blocked_24h: shield.blocked_attacks_24h ?? null,
     core_health_critical: ch.critical_count ?? null,
     core_health_recommended: ch.recommended_count ?? null,
     litespeed_active: ls.installed === true ? 1 : ls.installed === false ? 0 : null,
