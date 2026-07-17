@@ -18,49 +18,37 @@
 //
 // Batching turns ~2,651 round-trips into ~14. Measured here: 2,500 rows in ~1.2s.
 //
-// USAGE: DEVPW=<dev sa password> node test/market-monitor-batch.e2e.mjs
+// USAGE: DEVPW=<dev sa password> node --test test/market-monitor-batch.e2e.mjs
+//
+// With no DEVPW it reports SKIPPED — not passed, not failed. It used to
+// process.exit(2), which turned "this machine has no dev SQL" into a red suite
+// for everyone. A green tick for a test that never opened a connection would be
+// the opposite and worse lie.
 
-import sql from "mssql";
+import test from "node:test";
 import assert from "node:assert/strict";
+import sql from "mssql";
+
 import { mergePositionRows } from "../src/shared/marketMonitor.js";
 
 const HOST = process.env.DEV_SQL_HOST || "localhost";
 const PW = process.env.DEVPW || process.env.SQL_PASSWORD;
 
+// SAFETY, not hygiene: this test DELETEs. A non-loopback host is never something
+// we quietly skip past — it means someone is pointing a destructive test at a
+// shared or production server. Fail loudly, always, even without a password.
 if (!/^(localhost|127\.0\.0\.1|::1)$/i.test(HOST)) {
-  console.error(`\n🔴 REFUSING: "${HOST}" is not loopback. This test writes and deletes.`);
-  process.exit(2);
-}
-if (!PW) {
-  console.error("\n🔴 No DEVPW / SQL_PASSWORD set.");
-  process.exit(2);
+  throw new Error(
+    `REFUSING: DEV_SQL_HOST="${HOST}" is not loopback. This test writes and deletes rows.`
+  );
 }
 
-const pool = await new sql.ConnectionPool({
-  server: HOST, port: 1433, database: "iadm_services",
-  user: "SA", password: PW,
-  options: { encrypt: false, trustServerCertificate: true },
-}).connect();
+// A missing password just means "no dev SQL on this machine" — that is a skip.
+const skip = PW ? false : "no DEVPW / SQL_PASSWORD set — dev SQL Server not available here";
 
-const who = (await pool.request().query("SELECT SUSER_NAME() u, DB_NAME() d")).recordset[0];
-if (String(who.u).toLowerCase() !== "sa") {
-  console.error(`\n🔴 REFUSING: authenticated as "${who.u}", expected the dev sa login.`);
-  process.exit(2);
-}
-
-// A synthetic site id that no real tenant uses, so cleanup can be surgical.
+// Synthetic ids no real tenant uses, so cleanup can be surgical.
 const T = "a0000001-0000-0000-0000-000000000001";
 const S = "a0000001-0000-0000-0000-0000000000ff";
-
-const results = [];
-const check = (name, fn) => {
-  try { fn(); results.push({ name, ok: true }); console.log(`  ✅ ${name}`); }
-  catch (e) { results.push({ name, ok: false, error: e.message }); console.log(`  ❌ ${name}\n       ${String(e.message).split("\n")[0]}`); }
-};
-const clean = () => pool.request().input("s", sql.UniqueIdentifier, S)
-  .query("DELETE FROM arion.se_ranking_position_history WHERE site_id=@s");
-const count = async (where = "") => (await pool.request().input("s", sql.UniqueIdentifier, S)
-  .query(`SELECT COUNT(*) n, MAX(position) p FROM arion.se_ranking_position_history WHERE site_id=@s ${where}`)).recordset[0];
 
 const row = (kwId, pos, comp = null) => ({
   tenantId: T, siteId: S, projectId: "2465230", engineId: "1",
@@ -68,68 +56,81 @@ const row = (kwId, pos, comp = null) => ({
   competitorDomain: comp, pos, recordedFor: new Date("2026-07-17"),
 });
 
-console.log("\n══════════════════════════════════════════════════════════════");
-console.log(" Market Monitor — batched position writer (DEV ONLY)");
-console.log(`══════════════════════════════════════════════════════════════`);
-console.log(`  ${who.u}@${who.d}\n`);
+test("Market Monitor — batched position writer (real dev DB)", { skip }, async (t) => {
+  const pool = await new sql.ConnectionPool({
+    server: HOST, port: 1433, database: "iadm_services",
+    user: "SA", password: PW,
+    options: { encrypt: false, trustServerCertificate: true },
+  }).connect();
 
-await clean();
+  const who = (await pool.request().query("SELECT SUSER_NAME() u, DB_NAME() d")).recordset[0];
+  assert.equal(String(who.u).toLowerCase(), "sa",
+    `authenticated as "${who.u}", expected the dev sa login — refusing to write`);
 
-// 1 own-site + 4 competitors x 500 keywords = 2,500 — a realistic run.
-const many = [];
-for (let i = 0; i < 500; i++) many.push(row(i, (i % 100) + 1));
-for (const c of ["a.com", "b.com", "c.com", "d.com"]) {
-  for (let i = 0; i < 500; i++) many.push(row(i, (i % 100) + 1, c));
-}
+  const clean = () => pool.request().input("s", sql.UniqueIdentifier, S)
+    .query("DELETE FROM arion.se_ranking_position_history WHERE site_id=@s");
+  const count = async (where = "") => (await pool.request().input("s", sql.UniqueIdentifier, S)
+    .query(`SELECT COUNT(*) n, MAX(position) p FROM arion.se_ranking_position_history WHERE site_id=@s ${where}`)).recordset[0];
 
-const t0 = Date.now();
-await mergePositionRows(pool, many);
-const elapsed = Date.now() - t0;
-let n = await count();
-check(`a realistic ${many.length}-row run writes every row (${elapsed}ms)`, () => {
-  assert.equal(n.n, many.length, `wrote ${n.n} of ${many.length}`);
+  try {
+    await clean();
+
+    // 1 own-site + 4 competitors x 500 keywords = 2,500. IA's real daily run is
+    // 241 keywords x 11 series = 2,651, so this is life-sized.
+    const many = [];
+    for (let i = 0; i < 500; i++) many.push(row(i, (i % 100) + 1));
+    for (const c of ["a.com", "b.com", "c.com", "d.com"]) {
+      for (let i = 0; i < 500; i++) many.push(row(i, (i % 100) + 1, c));
+    }
+
+    const t0 = Date.now();
+    await mergePositionRows(pool, many);
+    const elapsed = Date.now() - t0;
+
+    await t.test(`a life-sized ${many.length}-row run writes every row (${elapsed}ms)`, async () => {
+      const n = await count();
+      assert.equal(n.n, many.length, `wrote ${n.n} of ${many.length}`);
+    });
+
+    await t.test("...and comfortably inside the 15s timeout that used to kill the run", () => {
+      // Not a benchmark — a regression guard. If someone reverts to one
+      // round-trip per row this blows past it immediately. ~1.2s observed;
+      // 10s leaves headroom on a slow machine while still catching the revert.
+      assert.ok(elapsed < 10_000, `took ${elapsed}ms — is this back to one round-trip per row?`);
+    });
+
+    await t.test("re-running is idempotent — MERGE updates, never duplicates", async () => {
+      await mergePositionRows(pool, many);
+      const n = await count();
+      assert.equal(n.n, many.length, `rows grew to ${n.n} — the daily run would duplicate history`);
+    });
+
+    await t.test("a NULL competitor_domain (own site) updates in place, not duplicates", async () => {
+      // The NULL-join trap: `tgt.competitor_domain = src.competitor_domain` is
+      // never true for two NULLs, so a naive batch inserts a fresh own-site row
+      // every day. Own-site rows are the ones the customer actually looks at.
+      await mergePositionRows(pool, [row(999, 5)]);
+      await mergePositionRows(pool, [row(999, 7)]);
+      const own = await count("AND keyword_id='999' AND competitor_domain IS NULL");
+      assert.equal(own.n, 1, "two NULLs did not match — own-site rows would duplicate every day");
+      assert.equal(own.p, 7, "the update did not take");
+    });
+
+    await t.test("duplicate join keys in one chunk de-duplicate, last-write-wins", async () => {
+      // Duplicate keys in one MERGE source fail the WHOLE chunk with "attempted
+      // to UPDATE or DELETE the same row of the target table more than once".
+      // last-write-wins matches the per-row behaviour this replaced.
+      await mergePositionRows(pool, [row(1234, 1), row(1234, 2), row(1234, 3)]);
+      const dup = await count("AND keyword_id='1234'");
+      assert.equal(dup.n, 1, "duplicate source rows were not collapsed");
+      assert.equal(dup.p, 3, "expected last-write-wins");
+    });
+
+    await t.test("an empty batch is a no-op, not an error", async () => {
+      await mergePositionRows(pool, []);
+    });
+  } finally {
+    await clean().catch(() => {});
+    await pool.close();
+  }
 });
-check(`...and comfortably inside the 15s timeout that used to kill it`, () => {
-  // Not a benchmark — a regression guard. If someone reverts to per-row
-  // round-trips this blows past it immediately. ~1.2s observed; 10s leaves
-  // generous headroom for a slow machine while still catching the regression.
-  assert.ok(elapsed < 10_000, `took ${elapsed}ms — is this back to one round-trip per row?`);
-});
-
-await mergePositionRows(pool, many);
-n = await count();
-check("re-running is idempotent — MERGE updates, never duplicates", () => {
-  assert.equal(n.n, many.length, `rows grew to ${n.n} — the daily run would duplicate history`);
-});
-
-// The NULL-join trap: `tgt.competitor_domain = src.competitor_domain` is NEVER
-// true for two NULLs, so a naive batch would insert a fresh own-site row daily.
-await mergePositionRows(pool, [row(999, 5)]);
-await mergePositionRows(pool, [row(999, 7)]);
-const own = await count("AND keyword_id='999' AND competitor_domain IS NULL");
-check("a NULL competitor_domain (own site) updates in place, not duplicates", () => {
-  assert.equal(own.n, 1, "two NULLs did not match — own-site rows would duplicate every day");
-  assert.equal(own.p, 7, "the update did not take");
-});
-
-// The multi-row MERGE gotcha: duplicate join keys in one source raise
-// "attempted to UPDATE or DELETE the same row of the target table more than
-// once" and fail the WHOLE chunk. The per-row version could never hit this.
-await mergePositionRows(pool, [row(1234, 1), row(1234, 2), row(1234, 3)]);
-const dup = await count("AND keyword_id='1234'");
-check("duplicate join keys in one chunk are de-duplicated, last-write-wins", () => {
-  assert.equal(dup.n, 1, "duplicate source rows were not collapsed");
-  assert.equal(dup.p, 3, "expected last-write-wins, matching the per-row behaviour it replaces");
-});
-
-check("an empty batch is a no-op, not an error", () => { /* proven by the await below */ });
-await mergePositionRows(pool, []);
-
-await clean();
-await pool.close();
-
-const passed = results.filter((r) => r.ok).length;
-console.log("\n══════════════════════════════════════════════════════════════");
-console.log(`  ${passed}/${results.length} passed`);
-if (passed !== results.length) { console.log("\n  RESULT: FAIL\n"); process.exit(1); }
-console.log("\n  RESULT: PASS — batched writer is correct, idempotent and fast.\n");
