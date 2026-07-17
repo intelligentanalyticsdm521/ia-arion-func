@@ -73,6 +73,95 @@ async function logJobComplete(pool, logId, status, rowsProcessed, errorMessage) 
     `);
 }
 
+// ── Batched position writer ──────────────────────────────────────────────────
+//
+// ⚠️ 2026-07-16 — this replaces ONE MERGE ROUND-TRIP PER KEYWORD PER COMPETITOR.
+// A real run issues ~2,651 of them, sequentially, and that is the documented code
+// cause of the "Timeout: Request failed to complete in 15000ms" failures
+// arion.market_monitor_job_log recorded on 2026-07-05 and 07-06 — the visible
+// prelude to the outage that started on 07-10.
+//
+// Now: one multi-row MERGE per CHUNK. 2,651 round-trips becomes ~14.
+//
+// CHUNK_SIZE is bounded by SQL Server's hard limit of 2,100 parameters per
+// statement. At 9 parameters per row, 200 rows = 1,800 — comfortably under, with
+// room for the limit to not be a cliff if a column is ever added.
+//
+// 🪤 THE MULTI-ROW MERGE GOTCHA: if the source contains two rows with the same
+// join key, SQL Server raises "The MERGE statement attempted to UPDATE or DELETE
+// the same row of the target table more than once" and the WHOLE chunk fails.
+// The per-row version could never hit this because each statement saw one row.
+// SE Ranking can legitimately return a duplicate (keyword_id, engine) — so rows
+// are de-duplicated on the exact join key before the MERGE, last-write-wins,
+// which matches the per-row behaviour it replaces.
+const POSITION_CHUNK_SIZE = 200;
+
+function dedupeByMergeKey(rows) {
+  // Join key = (site_id, site_engine_id, keyword_id, recorded_for, competitor_domain)
+  // — exactly the ON clause below, and the UQ_pos_history_daily unique index.
+  const byKey = new Map();
+  for (const r of rows) {
+    byKey.set(`${r.siteId}|${r.engineId}|${r.keywordId}|${r.recordedFor}|${r.competitorDomain ?? ""}`, r);
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * MERGE a batch of position rows. Returns the number of rows written.
+ *
+ * @param rows [{ tenantId, siteId, projectId, engineId, keywordId, keyword,
+ *                competitorDomain (string|null), pos (int|null), recordedFor }]
+ */
+export async function mergePositionRows(pool, rows) {
+  const deduped = dedupeByMergeKey(rows);
+  let written = 0;
+
+  for (let i = 0; i < deduped.length; i += POSITION_CHUNK_SIZE) {
+    const chunk = deduped.slice(i, i + POSITION_CHUNK_SIZE);
+    const req = pool.request();
+    const tuples = [];
+
+    chunk.forEach((r, j) => {
+      req.input(`t${j}`, sql.UniqueIdentifier, r.tenantId);
+      req.input(`s${j}`, sql.UniqueIdentifier, r.siteId);
+      req.input(`p${j}`, sql.NVarChar(50), r.projectId);
+      req.input(`e${j}`, sql.NVarChar(50), r.engineId);
+      req.input(`k${j}`, sql.NVarChar(50), r.keywordId);
+      req.input(`w${j}`, sql.NVarChar(500), r.keyword);
+      req.input(`c${j}`, sql.NVarChar(300), r.competitorDomain ?? null);
+      req.input(`o${j}`, sql.Int, r.pos);
+      req.input(`d${j}`, sql.Date, r.recordedFor);
+      tuples.push(`(@t${j}, @s${j}, @p${j}, @e${j}, @k${j}, @w${j}, @c${j}, @o${j}, @d${j})`);
+    });
+
+    // competitor_domain is NULLABLE and part of the join key, so the ON clause
+    // must compare it NULL-safely. `tgt.competitor_domain = src.competitor_domain`
+    // is never true for two NULLs, which would insert a duplicate own-site row
+    // every single day. The per-row version handled this with a literal
+    // `IS NULL` in the own-site branch; the unified batch needs the explicit
+    // both-null test.
+    const res = await req.query(`
+      MERGE arion.se_ranking_position_history WITH (HOLDLOCK) AS tgt
+      USING (VALUES ${tuples.join(", ")})
+        AS src (tenant_id, site_id, se_project_id, site_engine_id, keyword_id, keyword, competitor_domain, position, recorded_for)
+        ON  tgt.site_id        = src.site_id
+        AND tgt.site_engine_id = src.site_engine_id
+        AND tgt.keyword_id     = src.keyword_id
+        AND tgt.recorded_for   = src.recorded_for
+        AND ((tgt.competitor_domain IS NULL AND src.competitor_domain IS NULL)
+             OR tgt.competitor_domain = src.competitor_domain)
+      WHEN MATCHED THEN
+        UPDATE SET position = src.position, recorded_at = SYSDATETIMEOFFSET()
+      WHEN NOT MATCHED THEN
+        INSERT (tenant_id, site_id, se_project_id, site_engine_id, keyword_id, keyword, competitor_domain, position, recorded_for)
+        VALUES (src.tenant_id, src.site_id, src.se_project_id, src.site_engine_id, src.keyword_id, src.keyword, src.competitor_domain, src.position, src.recorded_for);
+    `);
+    written += res.rowsAffected?.[0] ?? chunk.length;
+  }
+
+  return written;
+}
+
 // ══════════════════════════════════════════════════════════════
 // JOB 1: Competitor Moves — daily position capture
 // ══════════════════════════════════════════════════════════════
@@ -111,6 +200,9 @@ export async function runMovesCapture(pool, log) {
   for (const site of sites) {
     let logId = null;
     let siteRows = 0;
+    // Per-site, declared inside the loop: rows must never leak from a site that
+    // failed into the flush of the next one.
+    const pendingRows = [];
     try {
       // Inside the try: if the job_log INSERT itself fails (e.g. the DB is the
       // problem), that must be a recorded per-site error rather than an
@@ -136,28 +228,21 @@ export async function runMovesCapture(pool, log) {
           const mostRecent = positions[positions.length - 1] || {};
           const pos = Number(mostRecent.pos) || null;
 
-          await pool.request()
-            .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
-            .input("siteId", sql.UniqueIdentifier, site.site_id)
-            .input("projectId", sql.NVarChar(50), projectId)
-            .input("engineId", sql.NVarChar(50), engineId)
-            .input("keywordId", sql.NVarChar(50), keywordId)
-            .input("keyword", sql.NVarChar(500), keywordText)
-            .input("pos", sql.Int, pos)
-            .input("recordedFor", sql.Date, today)
-            .query(`
-              MERGE arion.se_ranking_position_history WITH (HOLDLOCK) AS tgt
-              USING (SELECT @siteId AS site_id, @engineId AS site_engine_id, @keywordId AS keyword_id, @recordedFor AS recorded_for) AS src
-                ON  tgt.site_id = src.site_id
-                AND tgt.site_engine_id = src.site_engine_id
-                AND tgt.keyword_id = src.keyword_id
-                AND tgt.recorded_for = src.recorded_for
-                AND tgt.competitor_domain IS NULL
-              WHEN MATCHED THEN UPDATE SET position = @pos, recorded_at = SYSDATETIMEOFFSET()
-              WHEN NOT MATCHED THEN
-                INSERT (tenant_id, site_id, se_project_id, site_engine_id, keyword_id, keyword, competitor_domain, position, recorded_for)
-                VALUES (@tenantId, @siteId, @projectId, @engineId, @keywordId, @keyword, NULL, @pos, @recordedFor);
-            `);
+          // Collect, don't round-trip. This inner statement used to be ONE MERGE
+          // per keyword — ~2,651 sequential round-trips per run, which is what
+          // tipped 07-05/07-06 into the 15s request timeout. Flushed in chunks by
+          // mergePositionRows() once the whole site is gathered.
+          pendingRows.push({
+            tenantId: site.tenant_id,
+            siteId: site.site_id,
+            projectId,
+            engineId,
+            keywordId,
+            keyword: keywordText,
+            competitorDomain: null, // own site
+            pos,
+            recordedFor: today,
+          });
           siteRows++;
         }
       }
@@ -203,32 +288,32 @@ export async function runMovesCapture(pool, log) {
             const rawPos = Number(mostRecent.pos || 0);
             const pos = rawPos > 0 && rawPos < 100 ? rawPos : null;
 
-            await pool.request()
-              .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
-              .input("siteId", sql.UniqueIdentifier, site.site_id)
-              .input("projectId", sql.NVarChar(50), projectId)
-              .input("engineId", sql.NVarChar(50), engineId)
-              .input("keywordId", sql.NVarChar(50), keywordId)
-              .input("keyword", sql.NVarChar(500), keywordText)
-              .input("compDomain", sql.NVarChar(300), compDomain)
-              .input("pos", sql.Int, pos)
-              .input("recordedFor", sql.Date, today)
-              .query(`
-                MERGE arion.se_ranking_position_history WITH (HOLDLOCK) AS tgt
-                USING (SELECT @siteId AS site_id, @engineId AS site_engine_id, @keywordId AS keyword_id, @compDomain AS competitor_domain, @recordedFor AS recorded_for) AS src
-                  ON  tgt.site_id = src.site_id
-                  AND tgt.site_engine_id = src.site_engine_id
-                  AND tgt.keyword_id = src.keyword_id
-                  AND tgt.competitor_domain = src.competitor_domain
-                  AND tgt.recorded_for = src.recorded_for
-                WHEN MATCHED THEN UPDATE SET position = @pos, recorded_at = SYSDATETIMEOFFSET()
-                WHEN NOT MATCHED THEN
-                  INSERT (tenant_id, site_id, se_project_id, site_engine_id, keyword_id, keyword, competitor_domain, position, recorded_for)
-                  VALUES (@tenantId, @siteId, @projectId, @engineId, @keywordId, @keyword, @compDomain, @pos, @recordedFor);
-              `);
+            // Collect, don't round-trip — same change as the own-site loop above.
+            // This is where the bulk of the ~2,651 statements came from: one per
+            // keyword PER COMPETITOR.
+            pendingRows.push({
+              tenantId: site.tenant_id,
+              siteId: site.site_id,
+              projectId,
+              engineId,
+              keywordId,
+              keyword: keywordText,
+              competitorDomain: compDomain,
+              pos,
+              recordedFor: today,
+            });
             siteRows++;
           }
         }
+      }
+
+      // ── Flush: one multi-row MERGE per chunk instead of ~2,651 singles ──────
+      if (pendingRows.length) {
+        await mergePositionRows(pool, pendingRows);
+        log(
+          `[moves] ${site.domain}: flushed ${pendingRows.length} position row(s) in ` +
+          `${Math.ceil(pendingRows.length / POSITION_CHUNK_SIZE)} batch(es) (was ${pendingRows.length} round-trips)`
+        );
       }
 
       totalRows += siteRows;
