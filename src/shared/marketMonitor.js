@@ -77,15 +77,46 @@ async function logJobComplete(pool, logId, status, rowsProcessed, errorMessage) 
 // JOB 1: Competitor Moves — daily position capture
 // ══════════════════════════════════════════════════════════════
 export async function runMovesCapture(pool, log) {
-  const sites = await listAuthoritySites(pool);
+  // listAuthoritySites and logJobStart both used to sit OUTSIDE any try. A
+  // failure in either threw straight out of the caller having written no
+  // job_log row at all — which is exactly what production shows: the timer has
+  // fired every morning since 2026-07-10 while job_log's last 'moves' entry is
+  // 2026-07-10T03:16. The job could not report its own death because the
+  // reporting call was itself unprotected.
+  //
+  // Both are now attributed, so the next failure names its stage instead of
+  // vanishing.
+  let sites;
+  try {
+    sites = await listAuthoritySites(pool);
+  } catch (e) {
+    e.message = `listAuthoritySites failed (before any job_log row could be written): ${e.message}`;
+    throw e;
+  }
+
   log(`[moves] processing ${sites.length} Authority-tier site(s)`);
+
+  // NOTE: zero sites is NORMAL and is NOT the outage. listAuthoritySites filters
+  // to seo_addon_tier='authority', and IA owns the only Authority-tier site
+  // (the three clients are growth/essentials). So se_ranking_position_history
+  // being 100% iadm is BY DESIGN — not the "per-client history never persists"
+  // defect it was reported as. Verified against prod 2026-07-16.
+  if (sites.length === 0) {
+    log(`[moves] no Authority-tier sites with an se_ranking_project_id — nothing to capture (this is normal)`);
+  }
+
   let totalRows = 0;
   const errors = [];
 
   for (const site of sites) {
-    const logId = await logJobStart(pool, site.tenant_id, site.site_id, "moves");
+    let logId = null;
     let siteRows = 0;
     try {
+      // Inside the try: if the job_log INSERT itself fails (e.g. the DB is the
+      // problem), that must be a recorded per-site error rather than an
+      // unhandled throw that kills the whole run silently.
+      logId = await logJobStart(pool, site.tenant_id, site.site_id, "moves");
+
       const projectId = site.se_ranking_project_id;
 
       // Own-site current positions — /positions returns today's reading by default
@@ -204,9 +235,19 @@ export async function runMovesCapture(pool, log) {
       await logJobComplete(pool, logId, "success", siteRows, null);
       log(`[moves] ${site.domain}: ${siteRows} row(s) written`);
     } catch (err) {
-      errors.push({ site: site.domain, message: err.message });
-      await logJobComplete(pool, logId, "error", siteRows, err.message.slice(0, 1999));
+      // Record the real error FIRST. logJobComplete writes to the same database
+      // that may itself be the failure — if it throws here, an exception raised
+      // inside a catch block is unhandled and would take the whole run down,
+      // losing the diagnosis we are in the middle of capturing. The DB write is
+      // best-effort; the returned `errors` array is the reliable channel, and
+      // the caller now logs it loudly.
+      errors.push({ site: site.domain, message: err.message, stage: logId ? "capture" : "logJobStart" });
       log(`[moves] ${site.domain} ERROR: ${err.message}`);
+      try {
+        await logJobComplete(pool, logId, "error", siteRows, String(err.message).slice(0, 1999));
+      } catch (logErr) {
+        log(`[moves] ${site.domain}: could not record the error to job_log either: ${logErr.message}`);
+      }
     }
   }
 
