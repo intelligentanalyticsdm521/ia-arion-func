@@ -25,12 +25,35 @@ import { runArgusAutotopoff } from "../shared/argusAutotopoff.js";
  * so a tenant cannot be double-charged within the same UTC hour even if
  * the timer mis-fires or the webhook is slow to grant credits.
  */
+/**
+ * Global spend kill-switch (migration 146). FAIL-CLOSED: charging requires the
+ * PRESENCE of lumen.argus_platform_config key 'spend_enabled' = 'true'.
+ * Missing table, missing row, any other value, or a read error all mean SKIP —
+ * an absence can never arm the charger (reference_absence_based_guards_fail_open).
+ * Flip without a deploy:
+ *   UPDATE lumen.argus_platform_config SET [value]='true' WHERE [key]='spend_enabled'
+ */
+export async function isArgusSpendEnabled(pool) {
+  try {
+    const r = await pool
+      .request()
+      .query("SELECT [value] FROM lumen.argus_platform_config WHERE [key] = N'spend_enabled'");
+    return String(r.recordset?.[0]?.value || "").toLowerCase() === "true";
+  } catch {
+    return false; // unreadable switch = OFF
+  }
+}
+
 app.timer("argusAutotopoffCharger", {
   schedule: "0 3/15 * * * *",
   runOnStartup: false,
   handler: async (timer, context) => {
     context.log("[argus-autotopoff] starting", { scheduleStatus: timer.scheduleStatus });
     const pool = await getServicesPool();
+    if (!(await isArgusSpendEnabled(pool))) {
+      context.log("[argus-autotopoff] SKIPPED — global spend kill-switch is not 'true' (lumen.argus_platform_config)");
+      return;
+    }
     const summary = await runArgusAutotopoff(pool, {
       log: (msg) => context.log(`[argus-autotopoff] ${msg}`),
       secretLoader: getSecret,
