@@ -95,25 +95,25 @@ async function getStripeClient(secretLoader) {
  *   }, ...]
  */
 async function loadCandidates(pool) {
-  // Note: lumen.sp_argus_balance is a stored proc; the view-style query
-  // below mirrors the pool-summary view it returns so we can join
-  // declaratively in one shot. The proc itself sums:
-  //   granted - spent + refunded
-  // grouped by tenant_id. We replicate inline so a join is possible.
+  // 2026-07-21 split-brain fix: balance now reads the CANONICAL oliver
+  // ledger (oliver.argus_credit_grant/use) — the same tables the Phase-1
+  // balance endpoint and the My Brand meter use. The old lumen CTE read a
+  // ledger that debits never touched, so the charger would have seen a
+  // stale-high balance and never topped anyone off. Accumulate model:
+  // un-expired grants − all uses (matches creditLedger.getBalance).
   const r = await pool.request().query(`
     WITH balance AS (
       SELECT
         g.tenant_id,
-        SUM(CASE WHEN g.grant_type LIKE 'outlier_refund%' THEN g.credits ELSE g.credits END) AS lifetime_granted
-      FROM lumen.argus_credit_grant g
-      WHERE g.expires_at IS NULL OR g.expires_at > SYSUTCDATETIME()
+        SUM(g.credits) AS lifetime_granted
+      FROM oliver.argus_credit_grant g
+      WHERE g.expires_at IS NULL OR g.expires_at > SYSDATETIMEOFFSET()
       GROUP BY g.tenant_id
     ),
     spent AS (
-      SELECT a.tenant_id, SUM(a.credits_charged) AS lifetime_spent
-      FROM lumen.ai_call_audit a
-      WHERE a.outlier_refunded = 0
-      GROUP BY a.tenant_id
+      SELECT u.tenant_id, SUM(u.credits) AS lifetime_spent
+      FROM oliver.argus_credit_use u
+      GROUP BY u.tenant_id
     )
     SELECT
       c.tenant_id,
