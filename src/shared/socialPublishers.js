@@ -45,12 +45,61 @@ async function jsonOrText(resp) {
   try { return JSON.parse(text); } catch { return text; }
 }
 
-// ─── FACEBOOK PAGE FEED ─────────────────────────────────────────────────────
-//   POST /{page-id}/feed   { message, link?, access_token }
-//   POST /{page-id}/photos { url, caption, access_token } (image attachment)
-async function publishFacebook({ pageId, accessToken, message, imageUrls = [], link = null }) {
+// ─── FACEBOOK PAGE FEED / STORY ─────────────────────────────────────────────
+//   post:  POST /{page-id}/feed   { message, link?, access_token }
+//          POST /{page-id}/photos { url, caption, access_token } (image attachment)
+//   story: POST /{page-id}/photos        { url, published=false } → photo_id
+//          POST /{page-id}/photo_stories { photo_id }             → story live
+//   reel:  NOT YET — Facebook Reels need the resumable video-upload flow
+//          (/{page-id}/video_reels, upload phases). Lands with Phase B when
+//          real Meta credentials exist to exercise it. Until then a scheduled
+//          FB reel settles as a clean per-target failure instead of a stall.
+async function publishFacebook({ pageId, accessToken, message, imageUrls = [], link = null, contentType = "post" }) {
   if (!pageId)      return { ok: false, error_class: "missing_target", error_text: "No FB page_id on connection" };
   if (!accessToken) return { ok: false, error_class: "token_expired", error_text: "FB access token missing" };
+
+  if (contentType === "reel") {
+    return {
+      ok: false,
+      error_class: "unsupported_content_type",
+      error_text: "Facebook Reels publishing is not wired yet (needs the resumable video-upload flow — Phase B)",
+    };
+  }
+  if (contentType === "story") {
+    if (imageUrls.length === 0) {
+      return { ok: false, error_class: "content_policy", error_text: "Facebook Stories require an image" };
+    }
+    try {
+      // Step 1 — upload the photo unpublished so it doesn't hit the feed.
+      const photoResp = await fetch(`${FB_GRAPH_BASE}/${encodeURIComponent(pageId)}/photos`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          url: imageUrls[0],
+          published: "false",
+          access_token: accessToken,
+        }),
+      });
+      const photoData = await jsonOrText(photoResp);
+      if (!photoResp.ok) return { ok: false, ...classifyError(photoResp.status, photoData) };
+      const photoId = photoData?.id;
+      if (!photoId) return { ok: false, error_class: "other", error_text: "FB photo upload missing id" };
+
+      // Step 2 — attach it to a page story.
+      const storyResp = await fetch(`${FB_GRAPH_BASE}/${encodeURIComponent(pageId)}/photo_stories`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ photo_id: photoId, access_token: accessToken }),
+      });
+      const storyData = await jsonOrText(storyResp);
+      if (!storyResp.ok) return { ok: false, ...classifyError(storyResp.status, storyData) };
+      // photo_stories returns { success, post_id }; stories have no stable
+      // public permalink (they expire in 24h) so we leave permalink null.
+      return { ok: true, external_post_id: storyData?.post_id || photoId, permalink: null };
+    } catch (err) {
+      return { ok: false, error_class: "network", error_text: String(err.message || err).slice(0, 800) };
+    }
+  }
 
   try {
     let url, body;
@@ -88,30 +137,77 @@ async function publishFacebook({ pageId, accessToken, message, imageUrls = [], l
 }
 
 // ─── INSTAGRAM BUSINESS ─────────────────────────────────────────────────────
-//   POST /{ig-user-id}/media  { image_url, caption, access_token } → { id: container_id }
-//   POST /{ig-user-id}/media_publish { creation_id, access_token } → { id: media_id }
+//   post:  POST /{ig-user-id}/media  { image_url, caption } → { id: container_id }
+//   story: POST /{ig-user-id}/media  { media_type=STORIES, image_url|video_url }
+//   reel:  POST /{ig-user-id}/media  { media_type=REELS, video_url, caption }
+//          → then poll /{container-id}?fields=status_code until FINISHED
+//            (video containers process async; publishing early 400s)
+//   all:   POST /{ig-user-id}/media_publish { creation_id } → { id: media_id }
 //
-// IG requires at least one image; if imageUrls is empty we return a graceful
-// failure with error_class='content_policy' (IG rejects text-only posts).
-async function publishInstagram({ igUserId, accessToken, message, imageUrls = [] }) {
+// Failure shapes are graceful: text-only posts, image-less stories, and
+// video-less reels all settle as per-target failures, never throws.
+
+// Video containers (reels, video stories) process asynchronously — poll the
+// container's status_code before media_publish. FINISHED → good to publish;
+// ERROR → fail; anything else keeps waiting until attempts run out.
+async function igWaitForContainer(creationId, accessToken, { attempts = 10, delayMs = 6000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const resp = await fetch(
+      `${FB_GRAPH_BASE}/${encodeURIComponent(creationId)}?fields=status_code&access_token=${encodeURIComponent(accessToken)}`
+    );
+    const data = await jsonOrText(resp);
+    if (!resp.ok) return { ready: false, ...classifyError(resp.status, data) };
+    const status = data?.status_code || "";
+    if (status === "FINISHED") return { ready: true };
+    if (status === "ERROR") {
+      return { ready: false, error_class: "other", error_text: `IG container processing failed: ${JSON.stringify(data).slice(0, 400)}` };
+    }
+    await new Promise(r => setTimeout(r, delayMs));
+  }
+  return { ready: false, error_class: "provider_5xx", error_text: "IG container not ready after polling window" };
+}
+
+async function publishInstagram({ igUserId, accessToken, message, imageUrls = [], videoUrls = [], contentType = "post" }) {
   if (!igUserId)    return { ok: false, error_class: "missing_target", error_text: "No IG user/business id on connection" };
   if (!accessToken) return { ok: false, error_class: "token_expired", error_text: "IG access token missing" };
-  if (imageUrls.length === 0) {
-    return { ok: false, error_class: "content_policy", error_text: "Instagram requires at least one image" };
+
+  // Build the container params per content type.
+  const containerParams = { access_token: accessToken };
+  let isVideoContainer = false;
+  if (contentType === "story") {
+    // Stories take an image OR a video; captions aren't rendered on stories.
+    if (imageUrls.length > 0) {
+      containerParams.media_type = "STORIES";
+      containerParams.image_url = imageUrls[0];
+    } else if (videoUrls.length > 0) {
+      containerParams.media_type = "STORIES";
+      containerParams.video_url = videoUrls[0];
+      isVideoContainer = true;
+    } else {
+      return { ok: false, error_class: "content_policy", error_text: "Instagram Stories require an image or video" };
+    }
+  } else if (contentType === "reel") {
+    if (videoUrls.length === 0) {
+      return { ok: false, error_class: "content_policy", error_text: "Instagram Reels require a video asset" };
+    }
+    containerParams.media_type = "REELS";
+    containerParams.video_url = videoUrls[0];
+    containerParams.caption = message || "";
+    isVideoContainer = true;
+  } else {
+    if (imageUrls.length === 0) {
+      return { ok: false, error_class: "content_policy", error_text: "Instagram requires at least one image" };
+    }
+    containerParams.image_url = imageUrls[0];
+    containerParams.caption = message || "";
   }
 
   try {
     // Step 1 — container.
-    const containerUrl = `${FB_GRAPH_BASE}/${encodeURIComponent(igUserId)}/media`;
-    const containerBody = new URLSearchParams({
-      image_url: imageUrls[0],
-      caption: message || "",
-      access_token: accessToken,
-    });
-    const cResp = await fetch(containerUrl, {
+    const cResp = await fetch(`${FB_GRAPH_BASE}/${encodeURIComponent(igUserId)}/media`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: containerBody,
+      body: new URLSearchParams(containerParams),
     });
     const cData = await jsonOrText(cResp);
     if (!cResp.ok) return { ok: false, ...classifyError(cResp.status, cData) };
@@ -120,16 +216,19 @@ async function publishInstagram({ igUserId, accessToken, message, imageUrls = []
       return { ok: false, error_class: "other", error_text: "IG container missing id" };
     }
 
+    // Step 1.5 — video containers process async; wait until FINISHED.
+    if (isVideoContainer) {
+      const waited = await igWaitForContainer(creationId, accessToken);
+      if (!waited.ready) {
+        return { ok: false, error_class: waited.error_class || "other", error_text: waited.error_text || "IG container not ready" };
+      }
+    }
+
     // Step 2 — publish.
-    const publishUrl = `${FB_GRAPH_BASE}/${encodeURIComponent(igUserId)}/media_publish`;
-    const publishBody = new URLSearchParams({
-      creation_id: creationId,
-      access_token: accessToken,
-    });
-    const pResp = await fetch(publishUrl, {
+    const pResp = await fetch(`${FB_GRAPH_BASE}/${encodeURIComponent(igUserId)}/media_publish`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: publishBody,
+      body: new URLSearchParams({ creation_id: creationId, access_token: accessToken }),
     });
     const pData = await jsonOrText(pResp);
     if (!pResp.ok) return { ok: false, ...classifyError(pResp.status, pData) };
@@ -152,8 +251,12 @@ async function publishInstagram({ igUserId, accessToken, message, imageUrls = []
 // added when X moves their media endpoint into the v2 API. We surface a
 // friendly degradation: if imageUrls.length > 0 we publish the tweet text
 // and append the first image URL inline; that hits X's automatic-card path.
-async function publishX({ accessToken, message, imageUrls = [] }) {
+async function publishX({ accessToken, message, imageUrls = [], contentType = "post" }) {
   if (!accessToken) return { ok: false, error_class: "token_expired", error_text: "X access token missing" };
+  if (contentType !== "post") {
+    // Composer + LUMEN validation already block this; defense in depth.
+    return { ok: false, error_class: "unsupported_content_type", error_text: `X does not support ${contentType} content` };
+  }
 
   try {
     let text = (message || "").trim();
@@ -186,9 +289,14 @@ async function publishX({ accessToken, message, imageUrls = [] }) {
 // MVP we ship a text-only post with optional URL; image attachments are
 // noted as a follow-up. authorUrn must already be on the connection
 // (display_name persisted there during OAuth callback).
-async function publishLinkedIn({ accessToken, authorUrn, message, imageUrls = [] }) {
+async function publishLinkedIn({ accessToken, authorUrn, message, imageUrls = [], contentType = "post" }) {
   if (!accessToken) return { ok: false, error_class: "token_expired", error_text: "LinkedIn access token missing" };
   if (!authorUrn)   return { ok: false, error_class: "missing_target", error_text: "No LinkedIn author URN on connection" };
+  if (contentType !== "post") {
+    // LinkedIn killed Stories in 2021 and has no reel format; the composer
+    // and LUMEN validation block this upstream — defense in depth.
+    return { ok: false, error_class: "unsupported_content_type", error_text: `LinkedIn does not support ${contentType} content` };
+  }
 
   try {
     let commentary = (message || "").trim();

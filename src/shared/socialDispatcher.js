@@ -11,14 +11,19 @@
 //             - Resolve the access token from KV via access_token_kv_ref.
 //             - Pick the right body (per_platform_body[platform] override
 //               with body_default fallback).
-//             - Resolve image URLs from the attached brand_asset rows
+//             - Resolve image/video URLs from the attached brand_asset rows
 //               (blob_ref → CDN URL).
-//             - Call the matching publisher in socialPublishers.js.
+//             - Call the matching publisher in socialPublishers.js, routed
+//               by the post's content_type (post | story | reel — stories
+//               and reels are Facebook/Instagram only; the composer +
+//               LUMEN-API validation enforce that upstream, and the
+//               publishers fail gracefully as defense in depth).
 //        b. PATCH LUMEN-API /api/v1/my-brand/social/_internal/post/:postId/result
 //           with the per-target outcomes. LUMEN-API rolls post.status
-//           forward to 'published' / 'partial_failure' / 'failed' based
-//           on the aggregate of ALL targets (not just the ones in this
-//           PATCH — supports multi-tick settlement).
+//           forward to 'published' (any target live) / 'failed' (all targets
+//           failed) based on the aggregate of ALL targets (not just the ones
+//           in this PATCH — supports multi-tick settlement). Per-platform
+//           failure detail lives on the target rows.
 //   3. Errors NEVER bubble — a 500 on one post must not poison the others.
 //
 // Token resolution: access_token_kv_ref is the KV secret NAME (per the
@@ -82,7 +87,6 @@ export async function runSocialDispatchTick(log = () => {}) {
     scanned: 0,
     claimed: 0,
     published: 0,
-    partial_failure: 0,
     failed: 0,
     target_published: 0,
     target_failed: 0,
@@ -135,8 +139,13 @@ export async function runSocialDispatchTick(log = () => {}) {
     const postId = post.post_id;
     const tenantId = post.tenant_id;
     const targets = Array.isArray(post.targets) ? post.targets : [];
+    const contentType = (post.content_type || "post").toLowerCase();
     const imageUrls = (post.assets || [])
       .filter(a => a && (a.kind === "image" || /^image\//.test(a.mime || "")))
+      .map(a => resolveAssetUrl(a.blob_ref))
+      .filter(Boolean);
+    const videoUrls = (post.assets || [])
+      .filter(a => a && (a.kind === "video" || /^video\//.test(a.mime || "")))
       .map(a => resolveAssetUrl(a.blob_ref))
       .filter(Boolean);
 
@@ -190,7 +199,7 @@ export async function runSocialDispatchTick(log = () => {}) {
 
       let result;
       try {
-        const args = { accessToken, message, imageUrls };
+        const args = { accessToken, message, imageUrls, videoUrls, contentType };
         if (platform === "facebook")  args.pageId = t.page_id || t.external_account_id;
         if (platform === "instagram") args.igUserId = t.external_account_id;
         if (platform === "linkedin")  args.authorUrn = t.external_account_id; // expected to be urn:li:person:...
@@ -257,9 +266,8 @@ export async function runSocialDispatchTick(log = () => {}) {
       }
       const body = await patchResp.json().catch(() => ({}));
       const finalStatus = body?.data?.post_status;
-      if (finalStatus === "published")        summary.published++;
-      else if (finalStatus === "partial_failure") summary.partial_failure++;
-      else if (finalStatus === "failed")      summary.failed++;
+      if (finalStatus === "published")   summary.published++;
+      else if (finalStatus === "failed") summary.failed++;
       // null finalStatus = still publishing (more targets unresolved) — that's
       // fine, the next tick can settle them via a separate PATCH.
     } catch (err) {
