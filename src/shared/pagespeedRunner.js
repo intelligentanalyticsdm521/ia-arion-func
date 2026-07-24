@@ -72,7 +72,38 @@ function extractCrux(experience) {
   };
 }
 
+/**
+ * PSI is genuinely flaky — it returns HTTP 500 "Lighthouse returned error:
+ * Something went wrong." on a meaningful fraction of calls and succeeds on an
+ * immediate retry. Verified 2026-07-24: two back-to-back calls for
+ * intelligentanalyticsdm.com returned 500 then 200.
+ *
+ * Without a retry, one transient 500 silently drops that site's snapshot for
+ * the ENTIRE cadence window (30 or 90 days) — which is why prod held only 4
+ * PSI rows, all written by onboarding, and the monthly timer had never
+ * produced a single row.
+ */
+const PSI_MAX_ATTEMPTS = 3;
+const PSI_RETRY_BASE_MS = 4000;
+
 async function runPSI(url, strategy) {
+  let lastErr;
+  for (let attempt = 1; attempt <= PSI_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await runPSIOnce(url, strategy);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < PSI_MAX_ATTEMPTS) {
+        // Linear backoff — PSI is rate-limited per minute, so spacing out
+        // beats hammering it.
+        await new Promise((r) => setTimeout(r, PSI_RETRY_BASE_MS * attempt));
+      }
+    }
+  }
+  throw new Error(`${lastErr?.message || "unknown"} (after ${PSI_MAX_ATTEMPTS} attempts)`);
+}
+
+async function runPSIOnce(url, strategy) {
   // v2.0.12 — load from Key Vault if env var not set
   const apiKey = await getSecret('GOOGLE_API_KEY', 'GOOGLE-PAGESPEED-API-KEY');
   const params = new URLSearchParams({ url, strategy });
