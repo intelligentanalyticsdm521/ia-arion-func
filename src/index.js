@@ -11,6 +11,9 @@ import "./functions/marketMonitorPageChanges.js";
 import "./functions/pluginSnapshot.js";
 // Monthly PageSpeed — 1st of month, captures CrUX + Lighthouse opportunities
 import "./functions/monthlyPageSpeed.js";
+// IA Insights monthly snapshot — 1st of month 05:31 UTC, aggregates captured
+// data into arion.metric_monthly (the storage the Insights funnel reads).
+import "./functions/insightsMonthlySnapshot.js";
 // ARGUS Auto-Topoff — every 15 min, auto-refills credits via Stripe
 import "./functions/argusAutotopoffCharger.js";
 // F-LG.6 Lead Gen scheduled runs — every 30 min, dispatches scheduled search profiles

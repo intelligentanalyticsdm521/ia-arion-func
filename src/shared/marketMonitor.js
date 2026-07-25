@@ -40,6 +40,24 @@ async function listAuthoritySites(pool) {
   return r.recordset;
 }
 
+// IA Insights needs OWN-SITE keyword position history for EVERY site with an
+// SE Ranking project, regardless of tier — the kw_* series in
+// arion.metric_monthly are built from it (Brandon 2026-07-25; the client
+// backfill seeded 12 months of history that this keeps current). This
+// supersedes the 2026-07-16 "clients not syncing is by design" note below:
+// that was true when position history only served Market Monitor. Competitor
+// capture remains Authority-gated (MM tier gating is Brandon's open decision).
+async function listInsightsSites(pool) {
+  const r = await pool.request().query(`
+    SELECT site_id, tenant_id, domain, se_ranking_project_id, seo_addon_tier
+    FROM arion.site
+    WHERE se_ranking_project_id IS NOT NULL
+  `);
+  return r.recordset;
+}
+
+const isAuthority = (site) => String(site.seo_addon_tier || "").toLowerCase() === AUTHORITY_TIER;
+
 async function logJobStart(pool, tenantId, siteId, jobName) {
   const r = await pool.request()
     .input("tenantId", sql.UniqueIdentifier, tenantId)
@@ -177,21 +195,19 @@ export async function runMovesCapture(pool, log) {
   // vanishing.
   let sites;
   try {
-    sites = await listAuthoritySites(pool);
+    // 2026-07-25 — was listAuthoritySites. Own-site positions now capture for
+    // EVERY project site (IA Insights needs the kw_* series for all clients);
+    // competitor capture below stays Authority-gated per tier.
+    sites = await listInsightsSites(pool);
   } catch (e) {
-    e.message = `listAuthoritySites failed (before any job_log row could be written): ${e.message}`;
+    e.message = `listInsightsSites failed (before any job_log row could be written): ${e.message}`;
     throw e;
   }
 
-  log(`[moves] processing ${sites.length} Authority-tier site(s)`);
+  log(`[moves] processing ${sites.length} project site(s) (${sites.filter(isAuthority).length} Authority-tier)`);
 
-  // NOTE: zero sites is NORMAL and is NOT the outage. listAuthoritySites filters
-  // to seo_addon_tier='authority', and IA owns the only Authority-tier site
-  // (the three clients are growth/essentials). So se_ranking_position_history
-  // being 100% iadm is BY DESIGN — not the "per-client history never persists"
-  // defect it was reported as. Verified against prod 2026-07-16.
   if (sites.length === 0) {
-    log(`[moves] no Authority-tier sites with an se_ranking_project_id — nothing to capture (this is normal)`);
+    log(`[moves] no sites with an se_ranking_project_id — nothing to capture`);
   }
 
   let totalRows = 0;
@@ -254,10 +270,15 @@ export async function runMovesCapture(pool, log) {
       // The endpoint we were previously using (/sites/{id}/competitors?se_id=X)
       // returns 400 in the current v4 API. Fixed 2026-04-19 after reading the
       // Project API docs.
-      const compListRaw = await projectApi("GET", `/competitors/site/${encodeURIComponent(projectId)}`);
+      //
+      // 2026-07-25 — competitor capture is a Market Monitor (Authority-tier)
+      // feature; own-site capture above runs for every project site.
+      const compListRaw = isAuthority(site)
+        ? await projectApi("GET", `/competitors/site/${encodeURIComponent(projectId)}`)
+        : { ok: true, data: [] };
       const competitors = compListRaw.ok && Array.isArray(compListRaw.data) ? compListRaw.data : [];
 
-      if (competitors.length === 0) {
+      if (competitors.length === 0 && isAuthority(site)) {
         log(`[moves] ${site.domain}: no competitors tracked in SE Ranking project (or /competitors/site returned empty).`);
       }
 
