@@ -342,6 +342,18 @@ export async function snapshotSite(pool, site, log = () => {}) {
       WHERE site_id = @siteId
     `);
 
+  // Normalise a permalink to a PATH so GSC (full URL) and GA4 (path) can both
+  // be joined to this later without a second normalisation pass. Declared out
+  // here because the content, link and media blocks below all need it.
+  const toPath = (url) => {
+    if (!url) return null;
+    try {
+      const u = new URL(url);
+      const p = u.pathname.replace(/\/+$/, "");
+      return p === "" ? "/" : p;
+    } catch { return null; }
+  };
+
   // ── Per-PAGE content history (migration 048) ───────────────────────────
   // The rows /content/seo-detail returns were previously fetched, aggregated to
   // two averages, and thrown away. Storing them is what makes "this page has
@@ -353,16 +365,6 @@ export async function snapshotSite(pool, site, log = () => {}) {
   try {
     const rows = pulled.seoDetail?.data?.rows;
     if (Array.isArray(rows) && rows.length) {
-      // Normalise the permalink to a PATH so GSC (full URL) and GA4 (path) can
-      // both be joined to this later without a second normalisation pass.
-      const toPath = (url) => {
-        if (!url) return null;
-        try {
-          const u = new URL(url);
-          const p = u.pathname.replace(/\/+$/, "");
-          return p === "" ? "/" : p;
-        } catch { return null; }
-      };
 
       // MERGE per row keyed on (site, post, date) so a same-day re-run updates
       // rather than duplicating — a manual re-run is always safe.
@@ -424,7 +426,115 @@ export async function snapshotSite(pool, site, log = () => {}) {
     log(`  CONTENT CAPTURE FAILED: ${e.message}`);
   }
 
-  return { siteId: site.site_id, written: true, endpointsOk: okCount, endpointsTotal: totalCount, contentRows };
+  // ── Link graph + media library (migration 050, plugin v1.4.0) ──────────
+  // Both are whole-corpus views: "can anyone reach this page" and "what is the
+  // media library doing to the site". Sites on an older plugin 404 here, which
+  // is why each block checks for rows rather than assuming.
+  //
+  // Same rule as the content block above: additive and non-fatal. Neither of
+  // these may cost us the snapshot row that is already written.
+  let linkRows = 0;
+  try {
+    const rows = pulled.contentLinks?.data?.rows;
+    if (Array.isArray(rows) && rows.length) {
+      for (const r of rows) {
+        const postId = Number(r.post_id);
+        if (!Number.isInteger(postId)) continue;
+        await pool.request()
+          .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
+          .input("siteId", sql.UniqueIdentifier, site.site_id)
+          .input("day", sql.Date, today)
+          .input("postId", sql.Int, postId)
+          .input("title", sql.NVarChar(400), r.title ? String(r.title).slice(0, 400) : null)
+          .input("urlPath", sql.NVarChar(500), toPath(r.permalink))
+          .input("out", sql.Int, Number(r.links_out) || 0)
+          .input("outExt", sql.Int, Number(r.links_out_external) || 0)
+          .input("in_", sql.Int, Number(r.links_in) || 0)
+          .input("inMenu", sql.Bit, r.in_menu ? 1 : 0)
+          .input("orphan", sql.Bit, r.is_orphan ? 1 : 0)
+          .input("toMissing", sql.Int, (r.to_missing || []).length)
+          .input("toUnpub", sql.Int, (r.to_unpublished || []).length)
+          // The paths, not just the count — a number tells an owner they have a
+          // problem, the list tells them where it is.
+          .input("missPaths", sql.NVarChar(sql.MAX),
+                 (r.to_missing || []).length ? JSON.stringify(r.to_missing.slice(0, 40)) : null)
+          .query(`
+            MERGE arion.site_page_link AS tgt
+            USING (VALUES (@siteId, @postId, @day)) AS src(site_id, post_id, snapshot_date)
+              ON tgt.site_id = src.site_id AND tgt.post_id = src.post_id
+             AND tgt.snapshot_date = src.snapshot_date
+            WHEN MATCHED THEN UPDATE SET
+              title = @title, url_path = @urlPath, links_out = @out,
+              links_out_external = @outExt, links_in = @in_, in_menu = @inMenu,
+              is_orphan = @orphan, to_missing = @toMissing, to_unpublished = @toUnpub,
+              to_missing_paths = @missPaths, captured_at = SYSDATETIMEOFFSET()
+            WHEN NOT MATCHED THEN INSERT
+              (tenant_id, site_id, snapshot_date, post_id, title, url_path, links_out,
+               links_out_external, links_in, in_menu, is_orphan, to_missing,
+               to_unpublished, to_missing_paths)
+            VALUES
+              (@tenantId, @siteId, @day, @postId, @title, @urlPath, @out,
+               @outExt, @in_, @inMenu, @orphan, @toMissing, @toUnpub, @missPaths);`);
+        linkRows++;
+      }
+      const sum = pulled.contentLinks.data.summary || {};
+      log(`  stored ${linkRows} link row(s) — ${sum.orphan_count ?? "?"} orphan(s), ${sum.links_to_missing ?? "?"} link(s) to missing pages`);
+    }
+  } catch (e) {
+    log(`  LINK CAPTURE FAILED: ${e.message}`);
+  }
+
+  let mediaRows = 0;
+  try {
+    const rows = pulled.mediaAudit?.data?.rows;
+    if (Array.isArray(rows) && rows.length) {
+      for (const r of rows) {
+        const attId = Number(r.attachment_id);
+        if (!Number.isInteger(attId)) continue;
+        await pool.request()
+          .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
+          .input("siteId", sql.UniqueIdentifier, site.site_id)
+          .input("day", sql.Date, today)
+          .input("attId", sql.Int, attId)
+          .input("title", sql.NVarChar(400), r.title ? String(r.title).slice(0, 400) : null)
+          .input("file", sql.NVarChar(500), r.file ? String(r.file).slice(0, 500) : null)
+          .input("mime", sql.NVarChar(100), r.mime || null)
+          .input("bytes", sql.BigInt, Number.isFinite(Number(r.bytes)) ? Number(r.bytes) : null)
+          .input("w", sql.Int, r.width == null ? null : Number(r.width))
+          .input("h", sql.Int, r.height == null ? null : Number(r.height))
+          .input("alt", sql.Bit, r.has_alt ? 1 : 0)
+          .input("img", sql.Bit, r.is_image ? 1 : 0)
+          .input("ref", sql.Bit, r.referenced ? 1 : 0)
+          .input("big", sql.Bit, r.oversized ? 1 : 0)
+          .input("parent", sql.Int, r.attached_to == null ? null : Number(r.attached_to))
+          .input("up", sql.DateTime2, r.uploaded_at || null)
+          .query(`
+            MERGE arion.site_media_item AS tgt
+            USING (VALUES (@siteId, @attId, @day)) AS src(site_id, attachment_id, snapshot_date)
+              ON tgt.site_id = src.site_id AND tgt.attachment_id = src.attachment_id
+             AND tgt.snapshot_date = src.snapshot_date
+            WHEN MATCHED THEN UPDATE SET
+              title = @title, file_path = @file, mime = @mime, bytes = @bytes,
+              width = @w, height = @h, has_alt = @alt, is_image = @img,
+              referenced = @ref, oversized = @big, attached_to = @parent,
+              uploaded_at = @up, captured_at = SYSDATETIMEOFFSET()
+            WHEN NOT MATCHED THEN INSERT
+              (tenant_id, site_id, snapshot_date, attachment_id, title, file_path, mime,
+               bytes, width, height, has_alt, is_image, referenced, oversized,
+               attached_to, uploaded_at)
+            VALUES
+              (@tenantId, @siteId, @day, @attId, @title, @file, @mime,
+               @bytes, @w, @h, @alt, @img, @ref, @big, @parent, @up);`);
+        mediaRows++;
+      }
+      const sum = pulled.mediaAudit.data.summary || {};
+      log(`  stored ${mediaRows} media row(s) — ${Math.round((sum.library_bytes || 0) / 1048576)}MB, ${sum.missing_alt ?? "?"} missing alt, ${sum.unused ?? "?"} unused${sum.scan === "partial" ? " (PARTIAL scan)" : ""}`);
+    }
+  } catch (e) {
+    log(`  MEDIA CAPTURE FAILED: ${e.message}`);
+  }
+
+  return { siteId: site.site_id, written: true, endpointsOk: okCount, endpointsTotal: totalCount, contentRows, linkRows, mediaRows };
 }
 
 /**
