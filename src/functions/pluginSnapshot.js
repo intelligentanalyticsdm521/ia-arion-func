@@ -22,16 +22,43 @@ app.timer("arionPluginSnapshot", {
   runOnStartup: false,
   handler: async (timer, context) => {
     context.log("[plugin-snapshot] starting", { scheduleStatus: timer.scheduleStatus });
-    const pool = await getServicesPool();
-    const result = await runPluginSnapshot(pool, (m) => context.log(`[plugin-snapshot] ${m}`));
-    context.log(
-      `[plugin-snapshot] done — ${result.sitesChecked} site(s) checked, ` +
-      `${result.sitesWritten} snapshot(s) written, ${result.errors.length} error(s)`
-    );
-    if (result.errors.length) {
-      for (const e of result.errors) {
-        context.log(`[plugin-snapshot] error — site ${e.siteId}: ${e.reason}`);
+    const startedAt = Date.now();
+
+    // 2026-08-14 — same stage-named hardening the market-monitor handlers got
+    // after the 2026-07-10 silent outage (01c96fd). This job checked sites and
+    // wrote ZERO rows every night since it was written, and reported it at
+    // context.log level with a cheerful "done" — so nothing ever surfaced it.
+    // A job that processes sites and writes nothing is an OUTAGE, not an info line.
+    let stage = "getServicesPool";
+    try {
+      const pool = await getServicesPool();
+
+      stage = "runPluginSnapshot";
+      const result = await runPluginSnapshot(pool, (m) => context.log(`[plugin-snapshot] ${m}`));
+
+      context.log(
+        `[plugin-snapshot] done — ${result.sitesChecked} site(s) checked, ` +
+        `${result.sitesWritten} snapshot(s) written, ${result.errors.length} error(s) ` +
+        `in ${Date.now() - startedAt}ms`
+      );
+      if (result.sitesChecked > 0 && result.sitesWritten === 0) {
+        context.error(
+          `[plugin-snapshot] 🔴 checked ${result.sitesChecked} site(s) but wrote ZERO snapshots. ` +
+          `Errors: ${JSON.stringify(result.errors).slice(0, 800)}`
+        );
       }
+      if (result.errors.length) {
+        context.error(
+          `[plugin-snapshot] ${result.errors.length} site error(s): ${JSON.stringify(result.errors).slice(0, 800)}`
+        );
+      }
+    } catch (err) {
+      // Log full detail, then rethrow so the host records a FAILED invocation —
+      // never a cheerful success with nothing written.
+      context.error(`[plugin-snapshot] 🔴 FAILED at stage "${stage}" after ${Date.now() - startedAt}ms`, {
+        stage, message: err?.message, code: err?.code, name: err?.name, stack: err?.stack,
+      });
+      throw err;
     }
   },
 });

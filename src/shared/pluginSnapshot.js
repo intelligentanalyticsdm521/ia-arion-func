@@ -22,19 +22,50 @@ function resolveHost(site) {
   return null;
 }
 
+/**
+ * Authorization headers for an outbound plugin call.
+ *
+ * MIRRORS arion-api `lib/pluginClient.js buildPluginAuth()` — deliberately, and
+ * this file must not drift from it again.
+ *
+ * 2026-08-14 root cause: this job only ever implemented the LEGACY app-password
+ * path, and did not even SELECT `site_token_raw`. Every ARION-provisioned site
+ * authenticates with the site token (zero-config, set on every redeem/rotate);
+ * the app password only exists where a staffer created one by hand in WP admin.
+ * All four production sites have a token and NO app password — so every fetch
+ * returned "no host or app password", okCount hit 0, every site was SKIPped as
+ * unreachable, and `arion.site_plugin_snapshot` sat at 0 rows since the job was
+ * written. The live proxy in arion-api works precisely because it sends both.
+ *
+ * Send BOTH when available so the plugin's check_token_or_admin permission
+ * callback passes on either path.
+ */
+function buildPluginAuthHeaders(site) {
+  const headers = { Accept: "application/json" };
+  if (site?.site_token_raw) headers["X-Arion-Site-Token"] = site.site_token_raw;
+  if (site?.wp_app_password_ref) {
+    headers.Authorization = "Basic " + Buffer.from(site.wp_app_password_ref).toString("base64");
+  }
+  return headers;
+}
+
 async function pluginFetch(site, path) {
   const host = resolveHost(site);
-  if (!host || !site.wp_app_password_ref) {
-    return { ok: false, data: null, pluginStatus: "unreachable", errorText: "no host or app password" };
+  const headers = buildPluginAuthHeaders(site);
+  const hasAuth = Boolean(headers["X-Arion-Site-Token"] || headers.Authorization);
+  if (!host || !hasAuth) {
+    return {
+      ok: false, data: null, pluginStatus: "unreachable",
+      errorText: !host ? "no host" : "no site token or app password",
+    };
   }
   const url = `https://${host}/wp-json/intelligent-analytics/v1${path}`;
-  const auth = "Basic " + Buffer.from(site.wp_app_password_ref).toString("base64");
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     const res = await fetch(url, {
       method: "GET",
-      headers: { Accept: "application/json", Authorization: auth },
+      headers,
       signal: controller.signal,
     });
     clearTimeout(timer);
@@ -289,16 +320,26 @@ export async function snapshotSite(pool, site, log = () => {}) {
  * Run snapshot for every site that has plugin connectivity markers.
  */
 export async function runPluginSnapshot(pool, log = () => {}) {
+  // site_token_raw is the PRIMARY credential and was missing from this SELECT —
+  // see buildPluginAuthHeaders(). Without it every fetch was unauthenticated.
+  //
+  // The WHERE also had an operator-precedence bug: AND binds tighter than OR, so
+  //   status IS NULL OR status != 'suspended' AND <has credential>
+  // parsed as
+  //   status IS NULL OR (status != 'suspended' AND <has credential>)
+  // which admitted NULL-status sites carrying no credential at all — they then
+  // failed every fetch and were SKIPped as "unreachable". Parenthesised, and the
+  // credential test now accepts EITHER auth path.
   const sitesResult = await pool.request().query(`
-    SELECT site_id, tenant_id, domain, wp_admin_url, wp_app_password_ref,
+    SELECT site_id, tenant_id, domain, wp_admin_url, wp_app_password_ref, site_token_raw,
            plugin_status, plugin_version
     FROM arion.site
-    WHERE status IS NULL OR status != 'suspended'
-      AND wp_app_password_ref IS NOT NULL
+    WHERE (status IS NULL OR status <> 'suspended')
+      AND (site_token_raw IS NOT NULL OR wp_app_password_ref IS NOT NULL)
     ORDER BY plugin_last_status_at ASC
   `);
   const sites = sitesResult.recordset;
-  log(`found ${sites.length} site(s) with plugin app-password configured`);
+  log(`found ${sites.length} site(s) with a usable plugin credential`);
 
   const results = [];
   for (const site of sites) {
