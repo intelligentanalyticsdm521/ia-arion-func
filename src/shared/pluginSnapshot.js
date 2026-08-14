@@ -114,6 +114,13 @@ export async function pullPluginData(site) {
     // these are the line items the Website reports are built on, and until
     // 2026-08-14 they were fetched nowhere and stored nowhere.
     seoDetail: "/content/seo-detail",
+    // v1.4.0. Both are whole-corpus views the per-page rows cannot give:
+    // contentLinks answers "can anyone reach this page", mediaAudit answers
+    // "what is the media library doing to the site". Sites still on an older
+    // plugin 404 here, which pluginFetch records as a failed endpoint and the
+    // rest of the snapshot ignores.
+    contentLinks: "/content/links",
+    mediaAudit: "/media/audit",
     theme: "/theme",
     formsSummary: "/forms/summary",
     updates: "/updates/available",
@@ -362,6 +369,12 @@ export async function snapshotSite(pool, site, log = () => {}) {
           .input("wordCount", sql.Int, Number.isFinite(Number(r.word_count)) ? Number(r.word_count) : null)
           .input("noindex", sql.Bit, r.is_noindex ? 1 : 0)
           .input("lastMod", sql.DateTime2, r.last_modified || null)
+          // v1.4.0 (migration 049). Null on anything captured by an older
+          // plugin, which is the honest record: we did not know then.
+          .input("source", sql.NVarChar(20), r.content_source || null)
+          .input("h1", sql.Int, Number.isFinite(Number(r.h1_count)) ? Number(r.h1_count) : null)
+          .input("h2", sql.Int, Number.isFinite(Number(r.h2_count)) ? Number(r.h2_count) : null)
+          .input("h3", sql.Int, Number.isFinite(Number(r.h3_count)) ? Number(r.h3_count) : null)
           .query(`
             MERGE arion.site_content_item AS tgt
             USING (VALUES (@siteId, @postId, @day)) AS src(site_id, post_id, snapshot_date)
@@ -372,15 +385,16 @@ export async function snapshotSite(pool, site, log = () => {}) {
               seo_score = @seoScore, focus_keyword = @focusKw, has_meta_desc = @hasMeta,
               meta_desc_len = @metaLen, schema_type = @schemaType, readability = @readability,
               word_count = @wordCount, is_noindex = @noindex, last_modified = @lastMod,
+              content_source = @source, h1_count = @h1, h2_count = @h2, h3_count = @h3,
               captured_at = SYSDATETIMEOFFSET()
             WHEN NOT MATCHED THEN INSERT
               (tenant_id, site_id, snapshot_date, post_id, post_type, title, permalink, url_path,
                seo_score, focus_keyword, has_meta_desc, meta_desc_len, schema_type, readability,
-               word_count, is_noindex, last_modified)
+               word_count, is_noindex, last_modified, content_source, h1_count, h2_count, h3_count)
             VALUES
               (@tenantId, @siteId, @day, @postId, @postType, @title, @permalink, @urlPath,
                @seoScore, @focusKw, @hasMeta, @metaLen, @schemaType, @readability,
-               @wordCount, @noindex, @lastMod);`);
+               @wordCount, @noindex, @lastMod, @source, @h1, @h2, @h3);`);
         contentRows++;
       }
       log(`  stored ${contentRows} content item(s)`);
