@@ -41,13 +41,26 @@ function resolveHost(site) {
  * callback passes on either path.
  */
 function buildPluginAuthHeaders(site) {
-  const headers = { Accept: "application/json" };
+  // no-cache is not belt-and-braces here. Every one of our sites runs LiteSpeed,
+  // and LiteSpeed will happily cache a /wp-json response — which means the
+  // nightly snapshot can capture LAST WEEK'S numbers indefinitely and look
+  // completely healthy doing it. Caught 2026-08-14: the site had been upgraded
+  // to plugin v1.4.0 and the snapshot still stored the 1.3.3 payload, so every
+  // new column came back NULL and the word counts never moved.
+  const headers = {
+    Accept: "application/json",
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    Pragma: "no-cache",
+  };
   if (site?.site_token_raw) headers["X-Arion-Site-Token"] = site.site_token_raw;
   if (site?.wp_app_password_ref) {
     headers.Authorization = "Basic " + Buffer.from(site.wp_app_password_ref).toString("base64");
   }
   return headers;
 }
+
+/** One stamp per process, so every call in a run bypasses cache the same way. */
+const RUN_STAMP = Date.now().toString(36);
 
 async function pluginFetch(site, path) {
   const host = resolveHost(site);
@@ -59,7 +72,12 @@ async function pluginFetch(site, path) {
       errorText: !host ? "no host" : "no site token or app password",
     };
   }
-  const url = `https://${host}/wp-json/intelligent-analytics/v1${path}`;
+  // A cache-busting param as well as the headers: an edge cache is free to
+  // ignore Cache-Control on a response it already holds, but it cannot ignore a
+  // URL it has never seen. Stamped per snapshot run, not per request, so one
+  // run is internally consistent.
+  const url = `https://${host}/wp-json/intelligent-analytics/v1${path}`
+    + `${path.includes("?") ? "&" : "?"}_ia_cb=${RUN_STAMP}`;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
