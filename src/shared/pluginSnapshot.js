@@ -110,6 +110,10 @@ export async function pullPluginData(site) {
     cron: "/performance/cron",
     contentSummary: "/content/summary",
     seoAggregate: "/content/seo-aggregate",
+    // Per-PAGE rows (up to 500). The aggregate above only yields site averages;
+    // these are the line items the Website reports are built on, and until
+    // 2026-08-14 they were fetched nowhere and stored nowhere.
+    seoDetail: "/content/seo-detail",
     theme: "/theme",
     formsSummary: "/forms/summary",
     updates: "/updates/available",
@@ -313,7 +317,82 @@ export async function snapshotSite(pool, site, log = () => {}) {
       WHERE site_id = @siteId
     `);
 
-  return { siteId: site.site_id, written: true, endpointsOk: okCount, endpointsTotal: totalCount };
+  // ── Per-PAGE content history (migration 048) ───────────────────────────
+  // The rows /content/seo-detail returns were previously fetched, aggregated to
+  // two averages, and thrown away. Storing them is what makes "this page has
+  // been decaying since March" possible instead of only "this page is thin".
+  //
+  // Additive and non-fatal: a content failure must never cost us the snapshot
+  // row we already wrote above.
+  let contentRows = 0;
+  try {
+    const rows = pulled.seoDetail?.data?.rows;
+    if (Array.isArray(rows) && rows.length) {
+      // Normalise the permalink to a PATH so GSC (full URL) and GA4 (path) can
+      // both be joined to this later without a second normalisation pass.
+      const toPath = (url) => {
+        if (!url) return null;
+        try {
+          const u = new URL(url);
+          const p = u.pathname.replace(/\/+$/, "");
+          return p === "" ? "/" : p;
+        } catch { return null; }
+      };
+
+      // MERGE per row keyed on (site, post, date) so a same-day re-run updates
+      // rather than duplicating — a manual re-run is always safe.
+      for (const r of rows) {
+        const postId = Number(r.post_id);
+        if (!Number.isInteger(postId)) continue;
+        await pool.request()
+          .input("tenantId", sql.UniqueIdentifier, site.tenant_id)
+          .input("siteId", sql.UniqueIdentifier, site.site_id)
+          .input("day", sql.Date, today)
+          .input("postId", sql.Int, postId)
+          .input("postType", sql.NVarChar(20), r.type || null)
+          .input("title", sql.NVarChar(400), r.title ? String(r.title).slice(0, 400) : null)
+          .input("permalink", sql.NVarChar(1000), r.permalink || null)
+          .input("urlPath", sql.NVarChar(500), toPath(r.permalink))
+          .input("seoScore", sql.Int, Number.isFinite(Number(r.seo_score)) ? Number(r.seo_score) : null)
+          .input("focusKw", sql.NVarChar(255), r.focus_keyword || null)
+          .input("hasMeta", sql.Bit, r.has_meta_desc ? 1 : 0)
+          .input("metaLen", sql.Int, Number.isFinite(Number(r.meta_desc_len)) ? Number(r.meta_desc_len) : null)
+          .input("schemaType", sql.NVarChar(100), r.schema_type || null)
+          .input("readability", sql.Int, r.readability != null ? Number(r.readability) : null)
+          .input("wordCount", sql.Int, Number.isFinite(Number(r.word_count)) ? Number(r.word_count) : null)
+          .input("noindex", sql.Bit, r.is_noindex ? 1 : 0)
+          .input("lastMod", sql.DateTime2, r.last_modified || null)
+          .query(`
+            MERGE arion.site_content_item AS tgt
+            USING (VALUES (@siteId, @postId, @day)) AS src(site_id, post_id, snapshot_date)
+              ON tgt.site_id = src.site_id AND tgt.post_id = src.post_id
+             AND tgt.snapshot_date = src.snapshot_date
+            WHEN MATCHED THEN UPDATE SET
+              post_type = @postType, title = @title, permalink = @permalink, url_path = @urlPath,
+              seo_score = @seoScore, focus_keyword = @focusKw, has_meta_desc = @hasMeta,
+              meta_desc_len = @metaLen, schema_type = @schemaType, readability = @readability,
+              word_count = @wordCount, is_noindex = @noindex, last_modified = @lastMod,
+              captured_at = SYSDATETIMEOFFSET()
+            WHEN NOT MATCHED THEN INSERT
+              (tenant_id, site_id, snapshot_date, post_id, post_type, title, permalink, url_path,
+               seo_score, focus_keyword, has_meta_desc, meta_desc_len, schema_type, readability,
+               word_count, is_noindex, last_modified)
+            VALUES
+              (@tenantId, @siteId, @day, @postId, @postType, @title, @permalink, @urlPath,
+               @seoScore, @focusKw, @hasMeta, @metaLen, @schemaType, @readability,
+               @wordCount, @noindex, @lastMod);`);
+        contentRows++;
+      }
+      log(`  stored ${contentRows} content item(s)`);
+    } else if (pulled.seoDetail && !pulled.seoDetail.ok) {
+      log(`  content detail unavailable: ${pulled.seoDetail.errorText || "unknown"}`);
+    }
+  } catch (e) {
+    // Loud, but never fatal — the snapshot row above is already committed.
+    log(`  CONTENT CAPTURE FAILED: ${e.message}`);
+  }
+
+  return { siteId: site.site_id, written: true, endpointsOk: okCount, endpointsTotal: totalCount, contentRows };
 }
 
 /**
