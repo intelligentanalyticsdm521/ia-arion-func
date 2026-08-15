@@ -49,6 +49,60 @@ function extractOpportunities(audits, limit = 8) {
   return out.slice(0, limit);
 }
 
+/**
+ * Every audit that did NOT pass, tagged with the Lighthouse category it belongs
+ * to — which is what PageSpeed itself shows and what we were throwing away.
+ *
+ * The old extractOpportunities kept sixteen hardcoded performance keys, capped
+ * at eight. That discarded every accessibility check (contrast, labels, alt
+ * text, ARIA), every SEO check, every best-practices check (HTTPS, console
+ * errors, vulnerable libraries), and any performance diagnostic outside the
+ * sixteen. Brandon 2026-08-14: build out the same reporting Google has.
+ *
+ * `scoreDisplayMode` matters: "notApplicable" and "informative" audits have no
+ * pass/fail meaning, so counting them as failures would invent problems.
+ */
+function extractAllAudits(lhr) {
+  const audits = lhr?.audits || {};
+  const cats = lhr?.categories || {};
+  const out = [];
+  let passed = 0, total = 0;
+
+  for (const [catKey, cat] of Object.entries(cats)) {
+    for (const ref of cat.auditRefs || []) {
+      const a = audits[ref.id];
+      if (!a) continue;
+      const mode = a.scoreDisplayMode;
+      // Only binary/numeric audits are pass-or-fail. Manual and informative
+      // ones are notes, not findings.
+      if (mode === "notApplicable" || mode === "manual" || mode === "informative") continue;
+      total++;
+      if (a.score != null && a.score >= 0.9) { passed++; continue; }
+
+      out.push({
+        id: ref.id,
+        category: catKey,                       // performance | accessibility | seo | best-practices
+        title: a.title || ref.id,
+        description: (a.description || "").slice(0, 400),
+        display_value: a.displayValue || null,
+        numeric_value: a.numericValue ?? null,
+        numeric_unit: a.numericUnit || null,
+        score: a.score ?? null,
+        // Lighthouse weights an audit's contribution to its category score;
+        // a zero-weight failure is real but costs nothing, and sorting by it
+        // is what turns a list into a priority order.
+        weight: ref.weight ?? 0,
+        // How many elements on the page trip this audit — "12 images without
+        // alt text" is a different job from one.
+        items: Array.isArray(a.details?.items) ? a.details.items.length : null,
+      });
+    }
+  }
+
+  out.sort((a, b) => (b.weight - a.weight) || ((b.numeric_value ?? 0) - (a.numeric_value ?? 0)));
+  return { audits: out, passed, total };
+}
+
 function extractCrux(experience) {
   if (!experience?.metrics) return null;
   const m = experience.metrics;
@@ -145,10 +199,13 @@ async function runPSIOnce(url, strategy) {
         fcp: metricOf("first-contentful-paint"),
         si: metricOf("speed-index"),
         tbt: metricOf("total-blocking-time"),
+        ttfb: metricOf("server-response-time"),
       },
       field_url: extractCrux(data.loadingExperience),
       field_origin: extractCrux(data.originLoadingExperience),
       opportunities: extractOpportunities(audits),
+      // The whole picture, not the sixteen keys someone listed once.
+      allAudits: extractAllAudits(data.lighthouseResult),
       fetchedAt: new Date().toISOString(),
     };
   } catch (err) {
@@ -187,19 +244,29 @@ async function persistSnapshot(pool, tenantId, siteId, result, triggeredBy) {
     .input("opportunities", sql.NVarChar(sql.MAX), JSON.stringify(result.opportunities || []))
     .input("cruxUrl", sql.NVarChar(sql.MAX), result.field_url ? JSON.stringify(result.field_url) : null)
     .input("cruxOrigin", sql.NVarChar(sql.MAX), result.field_origin ? JSON.stringify(result.field_origin) : null)
+    .input("siMs", sql.Int, Math.round(m.si?.value ?? 0) || null)
+    .input("ttfbMs", sql.Int, Math.round(m.ttfb?.value ?? 0) || null)
+    // Migration 051. Every audit that did not pass, with its category and
+    // Lighthouse weight, plus the pass counts so "38 of 44 checks pass" is a
+    // number we can trend without re-parsing the blob on every read.
+    .input("auditsJson", sql.NVarChar(sql.MAX), JSON.stringify(result.allAudits?.audits || []))
+    .input("auditsPassed", sql.Int, result.allAudits?.passed ?? null)
+    .input("auditsTotal", sql.Int, result.allAudits?.total ?? null)
     .input("triggeredBy", sql.NVarChar(50), triggeredBy || "monthly")
     .query(`
       INSERT INTO arion.site_pagespeed_snapshot
         (tenant_id, site_id, run_date, strategy,
          performance_score, accessibility_score, seo_score, best_practices_score,
          mobile_performance, desktop_performance,
-         lcp_ms, inp_ms, cls_score, fcp_ms, tbt_ms,
-         opportunities, crux_url_json, crux_origin_json, triggered_by)
+         lcp_ms, inp_ms, cls_score, fcp_ms, tbt_ms, si_ms, ttfb_ms,
+         opportunities, crux_url_json, crux_origin_json,
+         audits_json, audits_passed, audits_total, triggered_by)
       VALUES (@tenantId, @siteId, @runDate, @strategy,
               @performanceScore, @accessibilityScore, @seoScore, @bestPracticesScore,
               @mobilePerformance, @desktopPerformance,
-              @lcpMs, @inpMs, @clsScore, @fcpMs, @tbtMs,
-              @opportunities, @cruxUrl, @cruxOrigin, @triggeredBy)
+              @lcpMs, @inpMs, @clsScore, @fcpMs, @tbtMs, @siMs, @ttfbMs,
+              @opportunities, @cruxUrl, @cruxOrigin,
+              @auditsJson, @auditsPassed, @auditsTotal, @triggeredBy)
     `);
 }
 
@@ -219,7 +286,14 @@ function cadenceDaysForTier(tier) {
   return 90; // safe default for unknown tiers
 }
 
-export async function runMonthlyPageSpeed(pool, log) {
+/**
+ * @param {object}  pool
+ * @param {Function} log
+ * @param {object}  [opts]
+ * @param {boolean} [opts.force] Ignore each site's cadence window. Used when a
+ *   change to WHAT we capture needs verifying now rather than next cycle.
+ */
+export async function runMonthlyPageSpeed(pool, log, opts = {}) {
   const out = { sitesProcessed: 0, sitesSkipped: 0, snapshotsWritten: 0, errors: [] };
 
   const sitesRes = await pool.request().query(`
@@ -238,7 +312,7 @@ export async function runMonthlyPageSpeed(pool, log) {
       const lastRun = await pool.request()
         .input("siteId", site.site_id)
         .query(`SELECT TOP 1 run_date FROM arion.site_pagespeed_snapshot WHERE site_id = @siteId AND triggered_by IN ('monthly','quarterly') ORDER BY run_date DESC`);
-      const lastRunDate = lastRun.recordset?.[0]?.run_date;
+      const lastRunDate = opts.force ? null : lastRun.recordset?.[0]?.run_date;
       if (lastRunDate) {
         const daysSince = (Date.now() - new Date(lastRunDate).getTime()) / 86400000;
         if (daysSince < cadence - 2) {
