@@ -2,6 +2,7 @@ import { app } from "@azure/functions";
 import { getServicesPool } from "../shared/servicesPool.js";
 import { getSecret } from "../shared/secrets.js";
 import { runArgusAutotopoff } from "../shared/argusAutotopoff.js";
+import { isArgusSpendEnabled } from "../shared/argusTables.js";
 
 /**
  * ARGUS Auto-Topoff Charger — every 15 minutes.
@@ -26,23 +27,15 @@ import { runArgusAutotopoff } from "../shared/argusAutotopoff.js";
  * the timer mis-fires or the webhook is slow to grant credits.
  */
 /**
- * Global spend kill-switch (migration 146). FAIL-CLOSED: charging requires the
- * PRESENCE of lumen.argus_platform_config key 'spend_enabled' = 'true'.
- * Missing table, missing row, any other value, or a read error all mean SKIP —
- * an absence can never arm the charger (reference_absence_based_guards_fail_open).
- * Flip without a deploy:
- *   UPDATE lumen.argus_platform_config SET [value]='true' WHERE [key]='spend_enabled'
+ * Global spend kill-switch — FAIL-CLOSED: charging requires the PRESENCE of
+ * spend_enabled = 'true'. Missing table, missing row, any other value, or a
+ * read error all mean SKIP — an absence can never arm the charger
+ * (reference_absence_based_guards_fail_open). The switch moved to
+ * argus.platform_config (migration 131); the shared helper reads the new name
+ * first with the old lumen name as fallback. Flip without a deploy:
+ *   UPDATE argus.platform_config SET [value]='true' WHERE [key]='spend_enabled'
  */
-export async function isArgusSpendEnabled(pool) {
-  try {
-    const r = await pool
-      .request()
-      .query("SELECT [value] FROM lumen.argus_platform_config WHERE [key] = N'spend_enabled'");
-    return String(r.recordset?.[0]?.value || "").toLowerCase() === "true";
-  } catch {
-    return false; // unreadable switch = OFF
-  }
-}
+export { isArgusSpendEnabled };
 
 app.timer("argusAutotopoffCharger", {
   schedule: "0 3/15 * * * *",
@@ -51,7 +44,7 @@ app.timer("argusAutotopoffCharger", {
     context.log("[argus-autotopoff] starting", { scheduleStatus: timer.scheduleStatus });
     const pool = await getServicesPool();
     if (!(await isArgusSpendEnabled(pool))) {
-      context.log("[argus-autotopoff] SKIPPED — global spend kill-switch is not 'true' (lumen.argus_platform_config)");
+      context.log("[argus-autotopoff] SKIPPED — global spend kill-switch is not 'true' (argus.platform_config)");
       return;
     }
     const summary = await runArgusAutotopoff(pool, {

@@ -23,6 +23,7 @@
  */
 
 import sql from "mssql";
+import { argusTables } from "./argusTables.js";
 
 // Locked pack price map (USD) — matches scripts/seed-argus-data-pack-catalog.mjs
 // `onetime` mode. Authoritative copy; Stripe is the source of truth at
@@ -95,24 +96,25 @@ async function getStripeClient(secretLoader) {
  *   }, ...]
  */
 async function loadCandidates(pool) {
-  // 2026-07-21 split-brain fix: balance now reads the CANONICAL oliver
-  // ledger (oliver.argus_credit_grant/use) — the same tables the Phase-1
-  // balance endpoint and the My Brand meter use. The old lumen CTE read a
-  // ledger that debits never touched, so the charger would have seen a
-  // stale-high balance and never topped anyone off. Accumulate model:
-  // un-expired grants − all uses (matches creditLedger.getBalance).
+  // 2026-07-21 split-brain fix: balance reads the CANONICAL ledger — the
+  // same tables the balance endpoint and the My Brand meter use (argus.*
+  // after migration 132; the oliver names before it). The old lumen CTE
+  // read a ledger that debits never touched, so the charger would have
+  // seen a stale-high balance and never topped anyone off. Accumulate
+  // model: un-expired grants − all uses (matches creditLedger.getBalance).
+  const T = await argusTables(pool);
   const r = await pool.request().query(`
     WITH balance AS (
       SELECT
         g.tenant_id,
         SUM(g.credits) AS lifetime_granted
-      FROM oliver.argus_credit_grant g
+      FROM ${T.CREDIT_GRANT} g
       WHERE g.expires_at IS NULL OR g.expires_at > SYSDATETIMEOFFSET()
       GROUP BY g.tenant_id
     ),
     spent AS (
       SELECT u.tenant_id, SUM(u.credits) AS lifetime_spent
-      FROM oliver.argus_credit_use u
+      FROM ${T.CREDIT_USE} u
       GROUP BY u.tenant_id
     )
     SELECT
@@ -127,7 +129,7 @@ async function loadCandidates(pool) {
       t.saas_stripe_customer_id,
       t.business_name,
       t.primary_contact_email
-    FROM lumen.argus_autotopoff_config c
+    FROM ${T.AUTOTOPOFF_CONFIG} c
     LEFT JOIN balance b ON b.tenant_id = c.tenant_id
     LEFT JOIN spent   s ON s.tenant_id = c.tenant_id
     LEFT JOIN core.tenants t ON t.tenant_id = c.tenant_id
@@ -142,11 +144,12 @@ async function loadCandidates(pool) {
  * fires when the calendar month flips.
  */
 async function recordCharge(pool, tenantId, packPriceUsd) {
+  const T = await argusTables(pool);
   await pool.request()
     .input("tid", sql.UniqueIdentifier, tenantId)
     .input("price", sql.Decimal(10, 2), packPriceUsd)
     .query(`
-      UPDATE lumen.argus_autotopoff_config
+      UPDATE ${T.AUTOTOPOFF_CONFIG}
          SET month_spent_usd       = month_spent_usd + @price,
              last_charge_at        = SYSUTCDATETIME(),
              last_charge_amount_usd = @price,
@@ -166,11 +169,12 @@ async function rolloverMonthIfNeeded(pool, tenantId, monthPeriodStart) {
     startDate.getUTCMonth() === firstOfMonth.getUTCMonth();
   if (sameMonth) return false;
 
+  const T = await argusTables(pool);
   await pool.request()
     .input("tid", sql.UniqueIdentifier, tenantId)
     .input("first", sql.Date, firstOfMonth)
     .query(`
-      UPDATE lumen.argus_autotopoff_config
+      UPDATE ${T.AUTOTOPOFF_CONFIG}
          SET month_spent_usd     = 0,
              month_period_start  = @first,
              updated_at          = SYSUTCDATETIME()
