@@ -11,12 +11,14 @@
 // Dispatch loop:
 //   1. SELECT every search_profile WHERE is_scheduled=1 AND next_run_at <= now,
 //      capped at MAX_DISPATCH_PER_TICK so a worker crash doesn't burn a whole
-//      backlog of credits.
+//      backlog of runs.
 //   2. For each:
 //        a. Re-read the row (lock-aware) — another worker may have grabbed it.
-//        b. Check the tenant's credit pool. If 0 and `pause_on_dry_pool` (default
-//           true), set next_run_at=NULL + schedule_paused_reason='no_credits'
-//           and skip (F-LG.6.5).
+//        b. (2026-09-04, G-5) NOTHING is checked against
+//           lumen.tenant_leadgen_credits any more — see the long note at the
+//           former credit block. The Stripe-derived allotment is resolved by
+//           LUMEN's settlement.ensureReserved when the sweeper claims the job,
+//           which clamps or skips it and marks the schedule paused.
 //        c. INSERT a search_job row directly (status='queued') with target_count
 //           = max_results_per_run or 100. The orchestrator picks it up from the
 //           DB independently — we do NOT make an HTTP call to LUMEN-API, which
@@ -65,7 +67,6 @@ import { getPlatformPool } from "./platformPool.js";
 
 const MAX_DISPATCH_PER_TICK = parseInt(process.env.LEADGEN_SCHEDULE_MAX_PER_TICK || "25", 10);
 const DEFAULT_TARGET = parseInt(process.env.LEADGEN_SCHEDULE_DEFAULT_TARGET || "100", 10);
-const PAUSE_ON_DRY_POOL = process.env.LEADGEN_SCHEDULE_PAUSE_ON_DRY_POOL !== "false";
 const NOTICE_BUSINESS_DAYS = parseInt(process.env.LEADGEN_PRE_RUN_NOTICE_DAYS || "2", 10);
 const NOTICE_TEMPLATE_KEY = "leadgen.pre_run_notice";
 const PORTAL_BASE = (process.env.PUBLIC_PORTAL_URL || "https://portal.intelligentanalyticsdm.com").replace(/\/+$/, "");
@@ -300,54 +301,23 @@ async function dispatchOne(pool, row, log, mssql) {
       return "skipped";
     }
 
-    // Credit pool check (F-LG.6.5).
-    const creditR = await new mssql.Request(tx)
-      .input("tenantId", mssql.NVarChar, row.tenant_id)
-      .query(`SELECT remaining, overage_per_lead_cents
-                FROM lumen.tenant_leadgen_credits
-               WHERE tenant_id = @tenantId`);
-    const credits = creditR.recordset[0] || { remaining: 0, overage_per_lead_cents: 100 };
+    // 2026-09-04 (G-5) — THE CREDIT POOL IS NO LONGER CONSULTED HERE.
+    //
+    // This block used to read lumen.tenant_leadgen_credits, pause the schedule
+    // when it hit zero, and decrement it. That table stopped being the truth
+    // when Release A moved lead allotments to the Stripe Leads package
+    // (services/leadgen/billing/leadsPackage.js): the timer paused schedules
+    // for tenants who had plenty of included leads, and let others through on
+    // stale credits. Two truths for one fact.
+    //
+    // Now the scheduler only asks "is this profile due?" and queues the job.
+    // LUMEN's sweeper calls settlement.ensureReserved, which resolves the
+    // Stripe-derived allotment, CLAMPS the target to what is actually
+    // schedulable, and skips the run when there is nothing left — writing
+    // schedule_last_run_status='paused_no_credits' so Saved Searches and the
+    // weekly digest still show "paused". One truth, in the place that owns it.
     const target = fresh.max_results_per_run || DEFAULT_TARGET;
-
-    if (credits.remaining <= 0 && PAUSE_ON_DRY_POOL) {
-      await new mssql.Request(tx)
-        .input("id", mssql.Int, row.id)
-        .query(`UPDATE lumen.search_profile
-                   SET next_run_at = NULL,
-                       schedule_paused_reason = 'no_credits',
-                       schedule_last_run_status = 'paused_no_credits',
-                       last_run_at = SYSUTCDATETIME()
-                 WHERE id = @id`);
-      await new mssql.Request(tx)
-        .input("tenantId", mssql.NVarChar, row.tenant_id)
-        .input("profileId", mssql.Int, row.id)
-        .query(`INSERT INTO lumen.leadgen_schedule_dispatch
-                  (tenant_id, profile_id, status, note)
-                  VALUES (@tenantId, @profileId, 'skipped_no_credits',
-                          'Credit pool empty; schedule paused until tenant tops up')`);
-      await tx.commit();
-      log(`[leadgen-schedule] profile=${row.id} tenant=${row.tenant_id} PAUSED (no credits)`);
-      return "paused";
-    }
-
-    // Decrement credits up to the target (overage stays paid by the tenant
-    // post-hoc if their overage_per_lead_cents > 0 and pay_method
-    // tolerates it). Scheduled runs default to 'credit_pool only' — we do NOT
-    // auto-charge a card off-session from the timer because the tenant didn't
-    // provide a payment_method_id on this code path. If the pool is partial,
-    // we run for as many leads as the pool covers.
-    const useCredits = Math.min(credits.remaining, target);
-    const effectiveTarget = useCredits; // run only what credits cover
-
-    if (useCredits > 0) {
-      await new mssql.Request(tx)
-        .input("tenantId", mssql.NVarChar, row.tenant_id)
-        .input("dec", mssql.Int, useCredits)
-        .query(`UPDATE lumen.tenant_leadgen_credits
-                   SET remaining = remaining - @dec,
-                       updated_at = SYSUTCDATETIME()
-                 WHERE tenant_id = @tenantId`);
-    }
+    const effectiveTarget = target;
 
     // Insert the search_job row. The orchestrator-sweeper in LUMEN-API picks
     // up status='queued' rows in a subsequent pass.
@@ -361,28 +331,17 @@ async function dispatchOne(pool, row, log, mssql) {
               VALUES (@tenantId, @profileId, @target, 'queued')`);
     const jobId = jobR.recordset[0].id;
 
-    // Mirror the billing row pattern used by POST /leadgen/jobs so the
-    // settlement code path (settleBilling) can refund unused credits when
-    // the orchestrator finishes. pay_method='credit_pool', stripe_charge_id
-    // is NULL because we didn't charge a card.
-    await new mssql.Request(tx)
-      .input("tenantId", mssql.NVarChar, row.tenant_id)
-      .input("jobId", mssql.Int, jobId)
-      .input("target", mssql.Int, effectiveTarget)
-      .input("payMethod", mssql.NVarChar, "credit_pool")
-      .input("creditsReserved", mssql.Int, useCredits)
-      .query(`INSERT INTO lumen.leadgen_billing
-                (tenant_id, search_job_id, target_count, pay_method,
-                 credits_reserved, stripe_amount_cents, status)
-              VALUES (@tenantId, @jobId, @target, @payMethod,
-                      @creditsReserved, 0, 'charged')`);
+    // NO billing row is written here any more. Writing one made
+    // ensureReserved's "does this job already have a reservation?" check say
+    // yes, so the clamp against the Stripe allotment never ran — the very
+    // drift this change removes. The sweeper reserves the job when it claims it.
 
     // Dispatch audit row.
     await new mssql.Request(tx)
       .input("tenantId", mssql.NVarChar, row.tenant_id)
       .input("profileId", mssql.Int, row.id)
       .input("jobId", mssql.Int, jobId)
-      .input("note", mssql.NVarChar, `target=${effectiveTarget} credits_used=${useCredits}`)
+      .input("note", mssql.NVarChar, `target=${effectiveTarget}`)
       .query(`INSERT INTO lumen.leadgen_schedule_dispatch
                 (tenant_id, profile_id, search_job_id, status, note)
                 VALUES (@tenantId, @profileId, @jobId, 'queued', @note)`);
