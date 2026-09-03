@@ -1,8 +1,14 @@
-// shared/leadgenScheduler.js — F-LG.6 scheduled-run dispatcher.
+// shared/leadgenScheduler.js — F-LG.6 scheduled-run dispatcher + the
+// 2-business-day pre-run notice (Release A.2 P5 / X1).
 //
-// Called every 30 minutes by functions/leadgenScheduledRuns.js.
+// Called every 30 minutes by functions/leadgenScheduledRuns.js. TWO passes per
+// tick, in this order:
 //
-// Loop:
+//   PASS 1 — dispatch: queue the runs that are due.
+//   PASS 2 — notice:   email the owner about runs that are two business days
+//                      out, while the settings can still be changed.
+//
+// Dispatch loop:
 //   1. SELECT every search_profile WHERE is_scheduled=1 AND next_run_at <= now,
 //      capped at MAX_DISPATCH_PER_TICK so a worker crash doesn't burn a whole
 //      backlog of credits.
@@ -44,6 +50,13 @@
 
 import mssqlDefault from "mssql";
 import { computeNextRun } from "./scheduleCadence.js";
+// P5 / X1 — the 2-business-day pre-run notice rides this same tick (no new
+// timer, no new Function App: POC rule + convention_timer_schedules).
+import { isWithinBusinessDays, formatRunDate } from "./businessDays.js";
+import { previewMessage, strainFromSummary } from "./leadgenRunMessages.js";
+import { renderTemplate } from "./leadgenNoticeTemplate.js";
+import { resolveTenantOwner, isEmailAllowed, sendViaWebhook } from "./weeklyDigestSender.js";
+import { getPlatformPool } from "./platformPool.js";
 
 // We accept an optional `mssql` instance as the THIRD arg so the verify
 // script (running under LUMEN-API's node_modules) can pass its own copy
@@ -53,6 +66,9 @@ import { computeNextRun } from "./scheduleCadence.js";
 const MAX_DISPATCH_PER_TICK = parseInt(process.env.LEADGEN_SCHEDULE_MAX_PER_TICK || "25", 10);
 const DEFAULT_TARGET = parseInt(process.env.LEADGEN_SCHEDULE_DEFAULT_TARGET || "100", 10);
 const PAUSE_ON_DRY_POOL = process.env.LEADGEN_SCHEDULE_PAUSE_ON_DRY_POOL !== "false";
+const NOTICE_BUSINESS_DAYS = parseInt(process.env.LEADGEN_PRE_RUN_NOTICE_DAYS || "2", 10);
+const NOTICE_TEMPLATE_KEY = "leadgen.pre_run_notice";
+const PORTAL_BASE = (process.env.PUBLIC_PORTAL_URL || "https://portal.intelligentanalyticsdm.com").replace(/\/+$/, "");
 
 /**
  * Run one tick.
@@ -111,6 +127,153 @@ export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssq
 
   log(`[leadgen-schedule] tick done: scanned=${summary.scanned} fired=${summary.fired} paused=${summary.paused} skipped=${summary.skipped} errors=${summary.errors.length}`);
   return summary;
+}
+
+/**
+ * PASS 2 — the 2-business-day pre-run notice (X1, LOCKED).
+ *
+ * Scheduled runs used to happen TO the customer: nothing between "scheduled"
+ * and "fired", so a search running with the wrong location or a category that
+ * has stopped producing was only discovered afterwards, on the invoice. This
+ * gives two working days to change it.
+ *
+ * Selection:
+ *   * the profile is scheduled and has a next_run_at in the future
+ *   * that run is at most NOTICE_BUSINESS_DAYS business days away, counted in
+ *     the profile's OWN timezone (Mon-Fri, no holiday table)
+ *   * we have not already given notice for this exact run
+ *     (pre_run_notice_for <> next_run_at) — so a second tick the same day sends
+ *     nothing, and changing the cadence produces a fresh notice for the new date
+ *
+ * The soft warning rides along when the profile's LAST completed run strained
+ * (summary_json.pool_strain) — a real forecast with no extra API call and no
+ * pool count, per X1.
+ *
+ * Errors never bubble: a broken notice must not stop runs from being queued.
+ *
+ * @returns { scanned, sent, skipped_suppressed, skipped_no_owner, skipped_no_template, errors[] }
+ */
+export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDefault, opts = {}) {
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const out = { scanned: 0, sent: 0, skipped_suppressed: 0, skipped_no_owner: 0, skipped_no_template: 0, errors: [] };
+  if (process.env.LEADGEN_PRE_RUN_NOTICE_DISABLED === "true") return out;
+
+  // A generous SQL window (calendar days) narrowed to BUSINESS days in JS,
+  // where the timezone lives. 5 calendar days always contains 2 business days.
+  const dueR = await pool.request()
+    .input("limit", mssql.Int, MAX_DISPATCH_PER_TICK)
+    .query(`
+      SELECT TOP (@limit)
+             id, tenant_id, profile_name, next_run_at, schedule_timezone,
+             pre_run_notice_for
+        FROM lumen.search_profile
+       WHERE is_scheduled = 1
+         AND next_run_at IS NOT NULL
+         AND next_run_at > SYSUTCDATETIME()
+         AND next_run_at <= DATEADD(day, 5, SYSUTCDATETIME())
+         AND (pre_run_notice_for IS NULL OR pre_run_notice_for <> next_run_at)
+       ORDER BY next_run_at ASC`);
+
+  if (!dueR.recordset.length) return out;
+
+  let platformPool = null;
+  try { platformPool = await getPlatformPool(); }
+  catch (e) { log(`[leadgen-notice] platform DB unreachable: ${e.message} — no notices this tick`); return out; }
+
+  for (const row of dueR.recordset) {
+    const tz = row.schedule_timezone || "America/Chicago";
+    if (!isWithinBusinessDays(now, row.next_run_at, NOTICE_BUSINESS_DAYS, tz)) continue;
+    out.scanned++;
+    try {
+      const owner = await resolveTenantOwner(platformPool, row.tenant_id, mssql);
+      if (!owner?.email) {
+        out.skipped_no_owner++;
+        log(`[leadgen-notice] profile=${row.id} skipped (no primary_contact_email)`);
+        continue;
+      }
+      const allowed = await isEmailAllowed(pool, row.tenant_id, owner.email, mssql);
+      if (!allowed.allowed) {
+        // Opted out is final — stamp it so we stop reconsidering this run.
+        await stampNoticed(pool, row, mssql);
+        out.skipped_suppressed++;
+        log(`[leadgen-notice] profile=${row.id} skipped (${allowed.reason})`);
+        continue;
+      }
+
+      const band = await lastRunStrain(pool, row.tenant_id, row.id, mssql);
+      const runDate = formatRunDate(row.next_run_at, tz);
+      const ctx = {
+        tenant: { name: owner.business_name || "your business" },
+        run: {
+          run_date: runDate,
+          profile_name: row.profile_name || "your saved search",
+          // The template already says "scheduled to run on <date> — check your
+          // settings"; this is the soft warning that rides along when the last
+          // run of this schedule strained. Empty on an ordinary schedule.
+          recommendation: previewMessage(band) || "",
+          settings_url: `${PORTAL_BASE}/app/spark/leadgen/saved`,
+        },
+      };
+      const rendered = await renderTemplate(pool, row.tenant_id, NOTICE_TEMPLATE_KEY, ctx, mssql);
+      if (!rendered) {
+        out.skipped_no_template++;
+        log(`[leadgen-notice] profile=${row.id} skipped — template ${NOTICE_TEMPLATE_KEY} missing (migration 144 not applied?)`);
+        continue;
+      }
+
+      if (process.env.LEADGEN_DIGEST_DRY_RUN === "1") {
+        log(`[leadgen-notice] DRY-RUN profile=${row.id} to=${owner.email} subject="${rendered.subject}"`);
+      } else {
+        await sendViaWebhook({
+          to: owner.email,
+          subject: rendered.subject,
+          html: rendered.html,
+          text: rendered.text,
+          tenantId: row.tenant_id,
+          log,
+          source: "leadgen-pre-run-notice",
+        });
+      }
+      // Stamp AFTER a successful send: a failed send is retried next tick
+      // rather than silently skipped.
+      await stampNoticed(pool, row, mssql);
+      out.sent++;
+      log(`[leadgen-notice] profile=${row.id} tenant=${row.tenant_id} notice sent for ${runDate} (strain=${band})`);
+    } catch (err) {
+      out.errors.push({ profile_id: row.id, error: err.message });
+      log(`[leadgen-notice] profile=${row.id} error: ${err.message}`);
+    }
+  }
+
+  log(`[leadgen-notice] pass done: ${JSON.stringify(out)}`);
+  return out;
+}
+
+/** Remember which run we have already given notice for. */
+async function stampNoticed(pool, row, mssql) {
+  await pool.request()
+    .input("id", mssql.Int, row.id)
+    .input("forRun", mssql.DateTimeOffset, new Date(row.next_run_at))
+    .query(`UPDATE lumen.search_profile SET pre_run_notice_for = @forRun WHERE id = @id`);
+}
+
+/**
+ * The strain band of this profile's last completed run — a forecast built from
+ * what actually happened, with no extra API call. Numbers stay in the DB; only
+ * the band leaves this function.
+ */
+async function lastRunStrain(pool, tenantId, profileId, mssql) {
+  try {
+    const r = await pool.request()
+      .input("tenantId", mssql.NVarChar, tenantId)
+      .input("pid", mssql.Int, profileId)
+      .query(`SELECT TOP 1 summary_json FROM lumen.search_job
+               WHERE tenant_id = @tenantId AND profile_id = @pid AND status = 'completed'
+               ORDER BY completed_at DESC`);
+    return strainFromSummary(r.recordset[0]?.summary_json);
+  } catch {
+    return "none";
+  }
 }
 
 /**
