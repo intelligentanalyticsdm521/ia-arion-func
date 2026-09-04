@@ -41,3 +41,6 @@ import "./functions/socialAnalyticsFetcher.js";
 // OnboardingRunner polls. Without this, Portal sites stick on
 // "Installing your tools" forever.
 import "./functions/onboardingRunnerWorker.js";
+// L16 Lead Gen monthly re-score — 03:29 UTC on the 1st. Rings LUMEN's
+// /internal/leadgen/rescore/monthly; all the scoring lives there.
+import "./functions/leadgenMonthlyRescore.js";
