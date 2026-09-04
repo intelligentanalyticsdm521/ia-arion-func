@@ -42,6 +42,7 @@ import {
 } from "./weeklyDigest.js";
 import { renderWeeklyDigestHtml } from "./weeklyDigestTemplate.js";
 import { getPlatformPool } from "./platformPool.js";
+import { businessDisplayName } from "./businessIdentity.js";
 
 const EMAIL_PATH_DEFAULT = "/api/acs/email/send";
 const MARKETING_CATEGORY = "marketing";
@@ -227,7 +228,12 @@ export async function runWeeklyDigestTick(servicesPool, log = () => {}, opts = {
         continue;
       }
 
-      const tenantName = owner.business_name || "Lead Gen";
+      // SEAM-10 (seams pack 4b) — the ONE resolver. This fell back to the
+      // literal "Lead Gen": a business whose name was not recorded got a
+      // weekly digest addressed to OUR INTERNAL PRODUCT NAME. Same class of
+      // failure as the "Intelligent Analytics" fallback pack 1 removed from
+      // LUMEN, and in a client-facing email either way.
+      const tenantName = await businessDisplayName(t.tenant_id);
       const rendered = renderWeeklyDigestHtml(digest, tenantName);
 
       if (dryRun) {

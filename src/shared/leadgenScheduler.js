@@ -57,6 +57,7 @@ import { computeNextRun } from "./scheduleCadence.js";
 import { isWithinBusinessDays, formatRunDate } from "./businessDays.js";
 import { previewMessage, strainFromSummary } from "./leadgenRunMessages.js";
 import { renderTemplate } from "./leadgenNoticeTemplate.js";
+import { businessDisplayName } from "./businessIdentity.js";
 import { resolveTenantOwner, isEmailAllowed, sendViaWebhook } from "./weeklyDigestSender.js";
 import { getPlatformPool } from "./platformPool.js";
 
@@ -215,7 +216,12 @@ export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDef
       const band = await lastRunStrain(pool, row.tenant_id, row.id, mssql);
       const runDate = formatRunDate(row.next_run_at, tz);
       const ctx = {
-        tenant: { name: owner.business_name || "your business" },
+        // SEAM-10 (seams pack 4b) — the ONE resolver. This chain never read
+        // preferred_business_name at all, so a business that had asked to be
+        // called something else was called something else EVERYWHERE except
+        // in its own Lead Gen notice, and its last resort ("your business")
+        // was a sixth spelling of the platform neutral.
+        tenant: { name: await businessDisplayName(row.tenant_id) },
         run: {
           run_date: runDate,
           profile_name: row.profile_name || "your saved search",
