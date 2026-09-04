@@ -6,7 +6,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "func start",
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "lint:contracts": "node scripts/_tools.mjs lint-sql-contracts ."
   },
   "dependencies": {
     "@azure/functions": "^4.6.0",

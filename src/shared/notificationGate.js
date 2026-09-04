@@ -29,6 +29,8 @@
 // NOT treated as "allow": an unconfigured guard that lets traffic through is
 // how /internal became an open relay in June.
 
+import { platformApiUrl, platformInternalToken } from "./platformEnv.js";
+
 export class GateUnavailable extends Error {
   constructor(reason, detail) {
     super(detail ? `${reason}: ${detail}` : reason);
@@ -45,15 +47,15 @@ const _cache = new Map(); // key -> { at, verdict }
 export function clearGateCache() { _cache.clear(); }
 
 export function platformBase() {
-  return (process.env.PLATFORM_API_URL || process.env.PLATFORM_API_BASE_URL || "")
-    .trim().replace(/\/+$/, "");
+  // SEAM-11: PLATFORM_API_URL, then the two legacy names, with one warning at
+  // boot naming the file to fix. This was its own fallback chain, in a
+  // DIFFERENT order from the one in the three sibling repos — set only one of
+  // the two names on the Functions app and half the calls authenticate.
+  return platformApiUrl();
 }
 
 export function internalToken() {
-  return (process.env.PLATFORM_INTERNAL_SERVICE_TOKEN
-    || process.env.PLATFORM_INTERNAL_TOKEN
-    || process.env.LUMEN_INTERNAL_SERVICE_TOKEN
-    || "").trim();
+  return platformInternalToken();
 }
 
 function cacheKey({ tenantId, channel, to, categoryKey, contactId }) {
