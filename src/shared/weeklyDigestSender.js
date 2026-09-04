@@ -33,6 +33,7 @@
 //
 // IMPORTANT — parameterized SQL only. No tenant-supplied strings in queries.
 
+import { canSend, GateUnavailable } from "./notificationGate.js";
 import mssqlDefault from "mssql";
 import {
   buildWeeklyDigestForTenant,
@@ -82,43 +83,39 @@ export async function resolveTenantOwner(platformPool, tenantId, mssql) {
 }
 
 /**
- * Master + per-category email suppression check.
- *   1. lumen.email_suppression (hard suppression list)
- *   2. lumen.contact.email_unsubscribed (master opt-out)
- *   3. lumen.contact.notification_preferences_json[marketing].email === false
+ * May we email this recipient?
  *
- * Returns { allowed: bool, reason?: string }.
+ * 🔴 2026-09-06, seams audit §2. What used to be written out here was copy FIVE
+ * of six of the same three-stage chain, and like the other four it never read
+ * `marketing_optin`: a client who pressed "one click stops all marketing email"
+ * kept receiving the weekly digest and the pre-run notice. It asks the ONE gate
+ * now — platform-api lib/notificationGate.js over
+ * POST /internal/notify/can-send — with the same `marketing` category as before.
+ *
+ * `servicesPool` and `mssql` are kept in the signature and ignored: both
+ * callers pass them, and a Function App is not the place to be changing four
+ * call sites to prove a point.
+ *
+ * THE FAIL DIRECTION CHANGED, DELIBERATELY. This used to fall through to
+ * "allowed" when it could not read. It now returns
+ * { allowed: false, reason: "gate_unavailable" }: the tenant is skipped for
+ * THIS run, the summary counts it, and next Monday asks again. A digest that is
+ * late is recoverable; a digest sent to somebody who unsubscribed is not.
+ *
+ * → { allowed: bool, reason?: string }
  */
-export async function isEmailAllowed(servicesPool, tenantId, email, mssql) {
+export async function isEmailAllowed(_servicesPool, tenantId, email, _mssql) {
   if (!email) return { allowed: false, reason: "no_email_on_file" };
-
-  // 1) hard suppression
   try {
-    const sup = await servicesPool.request()
-      .input("tid", mssql.NVarChar, tenantId)
-      .input("e", mssql.NVarChar, email)
-      .query(`SELECT TOP 1 id FROM lumen.email_suppression
-              WHERE tenant_id = @tid AND LOWER(email) = LOWER(@e)`);
-    if (sup.recordset.length) return { allowed: false, reason: "email_suppressed_master_list" };
-  } catch { /* table may not exist — fall through fail-open */ }
-
-  // 2/3) contact-level prefs
-  try {
-    const r = await servicesPool.request()
-      .input("tid", mssql.NVarChar, tenantId)
-      .input("e", mssql.NVarChar, email)
-      .query(`SELECT TOP 1 email_unsubscribed, notification_preferences_json
-                FROM lumen.contact
-               WHERE tenant_id = @tid AND LOWER(email) = LOWER(@e) AND is_deleted = 0`);
-    const row = r.recordset[0];
-    if (row?.email_unsubscribed) return { allowed: false, reason: "contact_master_email_unsubscribed" };
-    const prefs = safeJson(row?.notification_preferences_json) || {};
-    if (prefs[MARKETING_CATEGORY]?.email === false) {
-      return { allowed: false, reason: `contact_category_${MARKETING_CATEGORY}_email_opted_out` };
-    }
-  } catch { /* fail open */ }
-
-  return { allowed: true };
+    const verdict = await canSend({
+      tenantId, channel: "email", to: email, categoryKey: MARKETING_CATEGORY,
+    });
+    return { allowed: verdict.allowed, reason: verdict.reason || undefined };
+  } catch (e) {
+    if (!(e instanceof GateUnavailable)) throw e;
+    console.warn("[leadgen-digest] gate could not decide:", e.reason);
+    return { allowed: false, reason: "gate_unavailable" };
+  }
 }
 
 /**
