@@ -1,16 +1,24 @@
-// shared/leadgenScheduler.js — F-LG.6 scheduled-run dispatcher.
+// shared/leadgenScheduler.js — F-LG.6 scheduled-run dispatcher + the
+// 2-business-day pre-run notice (Release A.2 P5 / X1).
 //
-// Called every 30 minutes by functions/leadgenScheduledRuns.js.
+// Called every 30 minutes by functions/leadgenScheduledRuns.js. TWO passes per
+// tick, in this order:
 //
-// Loop:
+//   PASS 1 — dispatch: queue the runs that are due.
+//   PASS 2 — notice:   email the owner about runs that are two business days
+//                      out, while the settings can still be changed.
+//
+// Dispatch loop:
 //   1. SELECT every search_profile WHERE is_scheduled=1 AND next_run_at <= now,
 //      capped at MAX_DISPATCH_PER_TICK so a worker crash doesn't burn a whole
-//      backlog of credits.
+//      backlog of runs.
 //   2. For each:
 //        a. Re-read the row (lock-aware) — another worker may have grabbed it.
-//        b. Check the tenant's credit pool. If 0 and `pause_on_dry_pool` (default
-//           true), set next_run_at=NULL + schedule_paused_reason='no_credits'
-//           and skip (F-LG.6.5).
+//        b. (2026-09-04, G-5) NOTHING is checked against
+//           lumen.tenant_leadgen_credits any more — see the long note at the
+//           former credit block. The Stripe-derived allotment is resolved by
+//           LUMEN's settlement.ensureReserved when the sweeper claims the job,
+//           which clamps or skips it and marks the schedule paused.
 //        c. INSERT a search_job row directly (status='queued') with target_count
 //           = max_results_per_run or 100. The orchestrator picks it up from the
 //           DB independently — we do NOT make an HTTP call to LUMEN-API, which
@@ -44,6 +52,13 @@
 
 import mssqlDefault from "mssql";
 import { computeNextRun } from "./scheduleCadence.js";
+// P5 / X1 — the 2-business-day pre-run notice rides this same tick (no new
+// timer, no new Function App: POC rule + convention_timer_schedules).
+import { isWithinBusinessDays, formatRunDate } from "./businessDays.js";
+import { previewMessage, strainFromSummary } from "./leadgenRunMessages.js";
+import { renderTemplate } from "./leadgenNoticeTemplate.js";
+import { resolveTenantOwner, isEmailAllowed, sendViaWebhook } from "./weeklyDigestSender.js";
+import { getPlatformPool } from "./platformPool.js";
 
 // We accept an optional `mssql` instance as the THIRD arg so the verify
 // script (running under LUMEN-API's node_modules) can pass its own copy
@@ -52,7 +67,9 @@ import { computeNextRun } from "./scheduleCadence.js";
 
 const MAX_DISPATCH_PER_TICK = parseInt(process.env.LEADGEN_SCHEDULE_MAX_PER_TICK || "25", 10);
 const DEFAULT_TARGET = parseInt(process.env.LEADGEN_SCHEDULE_DEFAULT_TARGET || "100", 10);
-const PAUSE_ON_DRY_POOL = process.env.LEADGEN_SCHEDULE_PAUSE_ON_DRY_POOL !== "false";
+const NOTICE_BUSINESS_DAYS = parseInt(process.env.LEADGEN_PRE_RUN_NOTICE_DAYS || "2", 10);
+const NOTICE_TEMPLATE_KEY = "leadgen.pre_run_notice";
+const PORTAL_BASE = (process.env.PUBLIC_PORTAL_URL || "https://portal.intelligentanalyticsdm.com").replace(/\/+$/, "");
 
 /**
  * Run one tick.
@@ -114,6 +131,164 @@ export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssq
 }
 
 /**
+ * PASS 2 — the 2-business-day pre-run notice (X1, LOCKED).
+ *
+ * Scheduled runs used to happen TO the customer: nothing between "scheduled"
+ * and "fired", so a search running with the wrong location or a category that
+ * has stopped producing was only discovered afterwards, on the invoice. This
+ * gives two working days to change it.
+ *
+ * Selection:
+ *   * the profile is scheduled and has a next_run_at in the future
+ *   * that run is at most NOTICE_BUSINESS_DAYS business days away, counted in
+ *     the profile's OWN timezone (Mon-Fri, no holiday table)
+ *   * we have not already given notice for this exact run
+ *     (pre_run_notice_for <> next_run_at) — so a second tick the same day sends
+ *     nothing, and changing the cadence produces a fresh notice for the new date
+ *
+ * The soft warning rides along when the profile's LAST completed run strained
+ * (summary_json.pool_strain) — a real forecast with no extra API call and no
+ * pool count, per X1.
+ *
+ * Errors never bubble: a broken notice must not stop runs from being queued.
+ *
+ * @returns { scanned, sent, skipped_suppressed, skipped_no_owner, skipped_no_template, errors[] }
+ */
+export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDefault, opts = {}) {
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const out = { scanned: 0, sent: 0, skipped_suppressed: 0, skipped_no_owner: 0, skipped_no_template: 0, errors: [] };
+  if (process.env.LEADGEN_PRE_RUN_NOTICE_DISABLED === "true") return out;
+
+  // A generous SQL window in CALENDAR days, narrowed to BUSINESS days in JS
+  // where the timezone lives. It is derived from the business-day setting
+  // rather than hard-coded: a hard-coded 5 silently capped
+  // LEADGEN_PRE_RUN_NOTICE_DAYS at about three, so raising the setting did
+  // nothing (caught by the verifier's mutation run, 2026-09-04). Two calendar
+  // days per business day plus a weekend covers every case.
+  const calendarWindow = NOTICE_BUSINESS_DAYS * 2 + 3;
+  const dueR = await pool.request()
+    .input("limit", mssql.Int, MAX_DISPATCH_PER_TICK)
+    .input("windowDays", mssql.Int, calendarWindow)
+    .query(`
+      SELECT TOP (@limit)
+             id, tenant_id, profile_name, next_run_at, schedule_timezone,
+             pre_run_notice_for
+        FROM lumen.search_profile
+       WHERE is_scheduled = 1
+         AND next_run_at IS NOT NULL
+         AND next_run_at > SYSUTCDATETIME()
+         AND next_run_at <= DATEADD(day, @windowDays, SYSUTCDATETIME())
+         AND (pre_run_notice_for IS NULL OR pre_run_notice_for <> next_run_at)
+       ORDER BY next_run_at ASC`);
+
+  if (!dueR.recordset.length) return out;
+
+  // opts.platformPool is the same escape hatch the mssql override is: the timer
+  // authenticates to both databases with a managed identity, which a local
+  // verify run cannot do, so the verifier passes its own connected pools.
+  let platformPool = opts.platformPool || null;
+  if (!platformPool) {
+    try { platformPool = await getPlatformPool(); }
+    catch (e) { log(`[leadgen-notice] platform DB unreachable: ${e.message} — no notices this tick`); return out; }
+  }
+
+  for (const row of dueR.recordset) {
+    const tz = row.schedule_timezone || "America/Chicago";
+    if (!isWithinBusinessDays(now, row.next_run_at, NOTICE_BUSINESS_DAYS, tz)) continue;
+    out.scanned++;
+    try {
+      const owner = await resolveTenantOwner(platformPool, row.tenant_id, mssql);
+      if (!owner?.email) {
+        out.skipped_no_owner++;
+        log(`[leadgen-notice] profile=${row.id} skipped (no primary_contact_email)`);
+        continue;
+      }
+      const allowed = await isEmailAllowed(pool, row.tenant_id, owner.email, mssql);
+      if (!allowed.allowed) {
+        // Opted out is final — stamp it so we stop reconsidering this run.
+        await stampNoticed(pool, row, mssql);
+        out.skipped_suppressed++;
+        log(`[leadgen-notice] profile=${row.id} skipped (${allowed.reason})`);
+        continue;
+      }
+
+      const band = await lastRunStrain(pool, row.tenant_id, row.id, mssql);
+      const runDate = formatRunDate(row.next_run_at, tz);
+      const ctx = {
+        tenant: { name: owner.business_name || "your business" },
+        run: {
+          run_date: runDate,
+          profile_name: row.profile_name || "your saved search",
+          // The template already says "scheduled to run on <date> — check your
+          // settings"; this is the soft warning that rides along when the last
+          // run of this schedule strained. Empty on an ordinary schedule.
+          recommendation: previewMessage(band) || "",
+          settings_url: `${PORTAL_BASE}/app/spark/leadgen/saved`,
+        },
+      };
+      const rendered = await renderTemplate(pool, row.tenant_id, NOTICE_TEMPLATE_KEY, ctx, mssql);
+      if (!rendered) {
+        out.skipped_no_template++;
+        log(`[leadgen-notice] profile=${row.id} skipped — template ${NOTICE_TEMPLATE_KEY} missing (migration 144 not applied?)`);
+        continue;
+      }
+
+      if (process.env.LEADGEN_DIGEST_DRY_RUN === "1") {
+        log(`[leadgen-notice] DRY-RUN profile=${row.id} to=${owner.email} subject="${rendered.subject}"`);
+      } else {
+        await sendViaWebhook({
+          to: owner.email,
+          subject: rendered.subject,
+          html: rendered.html,
+          text: rendered.text,
+          tenantId: row.tenant_id,
+          log,
+          source: "leadgen-pre-run-notice",
+        });
+      }
+      // Stamp AFTER a successful send: a failed send is retried next tick
+      // rather than silently skipped.
+      await stampNoticed(pool, row, mssql);
+      out.sent++;
+      log(`[leadgen-notice] profile=${row.id} tenant=${row.tenant_id} notice sent for ${runDate} (strain=${band})`);
+    } catch (err) {
+      out.errors.push({ profile_id: row.id, error: err.message });
+      log(`[leadgen-notice] profile=${row.id} error: ${err.message}`);
+    }
+  }
+
+  log(`[leadgen-notice] pass done: ${JSON.stringify(out)}`);
+  return out;
+}
+
+/** Remember which run we have already given notice for. */
+async function stampNoticed(pool, row, mssql) {
+  await pool.request()
+    .input("id", mssql.Int, row.id)
+    .input("forRun", mssql.DateTimeOffset, new Date(row.next_run_at))
+    .query(`UPDATE lumen.search_profile SET pre_run_notice_for = @forRun WHERE id = @id`);
+}
+
+/**
+ * The strain band of this profile's last completed run — a forecast built from
+ * what actually happened, with no extra API call. Numbers stay in the DB; only
+ * the band leaves this function.
+ */
+async function lastRunStrain(pool, tenantId, profileId, mssql) {
+  try {
+    const r = await pool.request()
+      .input("tenantId", mssql.NVarChar, tenantId)
+      .input("pid", mssql.Int, profileId)
+      .query(`SELECT TOP 1 summary_json FROM lumen.search_job
+               WHERE tenant_id = @tenantId AND profile_id = @pid AND status = 'completed'
+               ORDER BY completed_at DESC`);
+    return strainFromSummary(r.recordset[0]?.summary_json);
+  } catch {
+    return "none";
+  }
+}
+
+/**
  * Dispatch a single due schedule. Returns 'fired' | 'paused' | 'skipped'.
  */
 async function dispatchOne(pool, row, log, mssql) {
@@ -137,54 +312,23 @@ async function dispatchOne(pool, row, log, mssql) {
       return "skipped";
     }
 
-    // Credit pool check (F-LG.6.5).
-    const creditR = await new mssql.Request(tx)
-      .input("tenantId", mssql.NVarChar, row.tenant_id)
-      .query(`SELECT remaining, overage_per_lead_cents
-                FROM lumen.tenant_leadgen_credits
-               WHERE tenant_id = @tenantId`);
-    const credits = creditR.recordset[0] || { remaining: 0, overage_per_lead_cents: 100 };
+    // 2026-09-04 (G-5) — THE CREDIT POOL IS NO LONGER CONSULTED HERE.
+    //
+    // This block used to read lumen.tenant_leadgen_credits, pause the schedule
+    // when it hit zero, and decrement it. That table stopped being the truth
+    // when Release A moved lead allotments to the Stripe Leads package
+    // (services/leadgen/billing/leadsPackage.js): the timer paused schedules
+    // for tenants who had plenty of included leads, and let others through on
+    // stale credits. Two truths for one fact.
+    //
+    // Now the scheduler only asks "is this profile due?" and queues the job.
+    // LUMEN's sweeper calls settlement.ensureReserved, which resolves the
+    // Stripe-derived allotment, CLAMPS the target to what is actually
+    // schedulable, and skips the run when there is nothing left — writing
+    // schedule_last_run_status='paused_no_credits' so Saved Searches and the
+    // weekly digest still show "paused". One truth, in the place that owns it.
     const target = fresh.max_results_per_run || DEFAULT_TARGET;
-
-    if (credits.remaining <= 0 && PAUSE_ON_DRY_POOL) {
-      await new mssql.Request(tx)
-        .input("id", mssql.Int, row.id)
-        .query(`UPDATE lumen.search_profile
-                   SET next_run_at = NULL,
-                       schedule_paused_reason = 'no_credits',
-                       schedule_last_run_status = 'paused_no_credits',
-                       last_run_at = SYSUTCDATETIME()
-                 WHERE id = @id`);
-      await new mssql.Request(tx)
-        .input("tenantId", mssql.NVarChar, row.tenant_id)
-        .input("profileId", mssql.Int, row.id)
-        .query(`INSERT INTO lumen.leadgen_schedule_dispatch
-                  (tenant_id, profile_id, status, note)
-                  VALUES (@tenantId, @profileId, 'skipped_no_credits',
-                          'Credit pool empty; schedule paused until tenant tops up')`);
-      await tx.commit();
-      log(`[leadgen-schedule] profile=${row.id} tenant=${row.tenant_id} PAUSED (no credits)`);
-      return "paused";
-    }
-
-    // Decrement credits up to the target (overage stays paid by the tenant
-    // post-hoc if their overage_per_lead_cents > 0 and pay_method
-    // tolerates it). Scheduled runs default to 'credit_pool only' — we do NOT
-    // auto-charge a card off-session from the timer because the tenant didn't
-    // provide a payment_method_id on this code path. If the pool is partial,
-    // we run for as many leads as the pool covers.
-    const useCredits = Math.min(credits.remaining, target);
-    const effectiveTarget = useCredits; // run only what credits cover
-
-    if (useCredits > 0) {
-      await new mssql.Request(tx)
-        .input("tenantId", mssql.NVarChar, row.tenant_id)
-        .input("dec", mssql.Int, useCredits)
-        .query(`UPDATE lumen.tenant_leadgen_credits
-                   SET remaining = remaining - @dec,
-                       updated_at = SYSUTCDATETIME()
-                 WHERE tenant_id = @tenantId`);
-    }
+    const effectiveTarget = target;
 
     // Insert the search_job row. The orchestrator-sweeper in LUMEN-API picks
     // up status='queued' rows in a subsequent pass.
@@ -198,28 +342,17 @@ async function dispatchOne(pool, row, log, mssql) {
               VALUES (@tenantId, @profileId, @target, 'queued')`);
     const jobId = jobR.recordset[0].id;
 
-    // Mirror the billing row pattern used by POST /leadgen/jobs so the
-    // settlement code path (settleBilling) can refund unused credits when
-    // the orchestrator finishes. pay_method='credit_pool', stripe_charge_id
-    // is NULL because we didn't charge a card.
-    await new mssql.Request(tx)
-      .input("tenantId", mssql.NVarChar, row.tenant_id)
-      .input("jobId", mssql.Int, jobId)
-      .input("target", mssql.Int, effectiveTarget)
-      .input("payMethod", mssql.NVarChar, "credit_pool")
-      .input("creditsReserved", mssql.Int, useCredits)
-      .query(`INSERT INTO lumen.leadgen_billing
-                (tenant_id, search_job_id, target_count, pay_method,
-                 credits_reserved, stripe_amount_cents, status)
-              VALUES (@tenantId, @jobId, @target, @payMethod,
-                      @creditsReserved, 0, 'charged')`);
+    // NO billing row is written here any more. Writing one made
+    // ensureReserved's "does this job already have a reservation?" check say
+    // yes, so the clamp against the Stripe allotment never ran — the very
+    // drift this change removes. The sweeper reserves the job when it claims it.
 
     // Dispatch audit row.
     await new mssql.Request(tx)
       .input("tenantId", mssql.NVarChar, row.tenant_id)
       .input("profileId", mssql.Int, row.id)
       .input("jobId", mssql.Int, jobId)
-      .input("note", mssql.NVarChar, `target=${effectiveTarget} credits_used=${useCredits}`)
+      .input("note", mssql.NVarChar, `target=${effectiveTarget}`)
       .query(`INSERT INTO lumen.leadgen_schedule_dispatch
                 (tenant_id, profile_id, search_job_id, status, note)
                 VALUES (@tenantId, @profileId, @jobId, 'queued', @note)`);

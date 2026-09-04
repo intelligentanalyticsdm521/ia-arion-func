@@ -26,6 +26,11 @@
 //   LEADGEN_DIGEST_FROM_EMAIL    — optional override; falls back to ACS default.
 //   LEADGEN_DIGEST_FROM_NAME     — optional display name.
 //
+// The owner lookup, the suppression chain and the ACS send are EXPORTED: the
+// 2-business-day pre-run notice (leadgenScheduler.js) is the same email to the
+// same person under the same opt-out, and a second copy of any of it would be a
+// second set of rules to keep in step.
+//
 // IMPORTANT — parameterized SQL only. No tenant-supplied strings in queries.
 
 import mssqlDefault from "mssql";
@@ -49,7 +54,7 @@ function safeJson(s) {
  * Pull tenant business_name + primary_contact_email from iadm_platform.core.tenants.
  * Returns null if the tenant row is missing — caller logs + skips.
  */
-async function resolveTenantOwner(platformPool, tenantId, mssql) {
+export async function resolveTenantOwner(platformPool, tenantId, mssql) {
   // core.tenants.tenant_id is UniqueIdentifier; callers pass a string UUID.
   // We try UniqueIdentifier first; fall back to NVarChar for any legacy tenants
   // whose id doesn't parse as a GUID (shouldn't happen in prod but keeps the
@@ -84,7 +89,7 @@ async function resolveTenantOwner(platformPool, tenantId, mssql) {
  *
  * Returns { allowed: bool, reason?: string }.
  */
-async function isEmailAllowed(servicesPool, tenantId, email, mssql) {
+export async function isEmailAllowed(servicesPool, tenantId, email, mssql) {
   if (!email) return { allowed: false, reason: "no_email_on_file" };
 
   // 1) hard suppression
@@ -120,7 +125,7 @@ async function isEmailAllowed(servicesPool, tenantId, email, mssql) {
  * POST the rendered email to iadm-webhooks ACS sender.
  * Throws on non-2xx.
  */
-async function sendViaWebhook({ to, subject, html, text, tenantId, log }) {
+export async function sendViaWebhook({ to, subject, html, text, tenantId, log, source = "leadgen-weekly-digest" }) {
   const base = (process.env.WEBHOOKS_BASE_URL || process.env.WEBHOOK_BASE_URL || "").trim();
   const key = (process.env.IADM_WEBHOOK_KEY || "").trim();
   if (!base || !key) throw new Error("WEBHOOKS_BASE_URL and IADM_WEBHOOK_KEY must be set");
@@ -137,8 +142,8 @@ async function sendViaWebhook({ to, subject, html, text, tenantId, log }) {
     text,
     fromEmail,
     fromName,
-    source: "leadgen-weekly-digest",
-    correlationId: `leadgen-digest-${tenantId}-${Date.now()}`,
+    source,
+    correlationId: `${source}-${tenantId}-${Date.now()}`,
   };
 
   const res = await fetch(url, {
@@ -157,7 +162,7 @@ async function sendViaWebhook({ to, subject, html, text, tenantId, log }) {
   }
   let parsed = null;
   try { parsed = JSON.parse(respText); } catch { /* may not be JSON */ }
-  log(`[leadgen-digest] sent tenant=${tenantId} messageId=${parsed?.messageId || "?"}`);
+  log(`[${source}] sent tenant=${tenantId} messageId=${parsed?.messageId || "?"}`);
   return parsed;
 }
 
