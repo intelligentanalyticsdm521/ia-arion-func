@@ -159,10 +159,16 @@ export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDef
   const out = { scanned: 0, sent: 0, skipped_suppressed: 0, skipped_no_owner: 0, skipped_no_template: 0, errors: [] };
   if (process.env.LEADGEN_PRE_RUN_NOTICE_DISABLED === "true") return out;
 
-  // A generous SQL window (calendar days) narrowed to BUSINESS days in JS,
-  // where the timezone lives. 5 calendar days always contains 2 business days.
+  // A generous SQL window in CALENDAR days, narrowed to BUSINESS days in JS
+  // where the timezone lives. It is derived from the business-day setting
+  // rather than hard-coded: a hard-coded 5 silently capped
+  // LEADGEN_PRE_RUN_NOTICE_DAYS at about three, so raising the setting did
+  // nothing (caught by the verifier's mutation run, 2026-09-04). Two calendar
+  // days per business day plus a weekend covers every case.
+  const calendarWindow = NOTICE_BUSINESS_DAYS * 2 + 3;
   const dueR = await pool.request()
     .input("limit", mssql.Int, MAX_DISPATCH_PER_TICK)
+    .input("windowDays", mssql.Int, calendarWindow)
     .query(`
       SELECT TOP (@limit)
              id, tenant_id, profile_name, next_run_at, schedule_timezone,
@@ -171,15 +177,20 @@ export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDef
        WHERE is_scheduled = 1
          AND next_run_at IS NOT NULL
          AND next_run_at > SYSUTCDATETIME()
-         AND next_run_at <= DATEADD(day, 5, SYSUTCDATETIME())
+         AND next_run_at <= DATEADD(day, @windowDays, SYSUTCDATETIME())
          AND (pre_run_notice_for IS NULL OR pre_run_notice_for <> next_run_at)
        ORDER BY next_run_at ASC`);
 
   if (!dueR.recordset.length) return out;
 
-  let platformPool = null;
-  try { platformPool = await getPlatformPool(); }
-  catch (e) { log(`[leadgen-notice] platform DB unreachable: ${e.message} — no notices this tick`); return out; }
+  // opts.platformPool is the same escape hatch the mssql override is: the timer
+  // authenticates to both databases with a managed identity, which a local
+  // verify run cannot do, so the verifier passes its own connected pools.
+  let platformPool = opts.platformPool || null;
+  if (!platformPool) {
+    try { platformPool = await getPlatformPool(); }
+    catch (e) { log(`[leadgen-notice] platform DB unreachable: ${e.message} — no notices this tick`); return out; }
+  }
 
   for (const row of dueR.recordset) {
     const tz = row.schedule_timezone || "America/Chicago";
