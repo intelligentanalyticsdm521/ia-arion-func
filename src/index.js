@@ -44,3 +44,13 @@ import "./functions/onboardingRunnerWorker.js";
 // L16 Lead Gen monthly re-score — 03:29 UTC on the 1st. Rings LUMEN's
 // /internal/leadgen/rescore/monthly; all the scoring lives there.
 import "./functions/leadgenMonthlyRescore.js";
+// ARGUS agent weekly cycles — both are thin bell-ringers, exactly like the
+// two above: every piece of logic lives in the API that owns the data.
+//   ARION Content & Social Agent — Mon 05:41 UTC → arion-api
+//     POST /internal/content-agent-tick. Kill switch CONTENT_AGENT_DISABLED.
+//     NOTE: that endpoint is not on the arion-api line yet (see the file).
+//   SPARK Campaign & Automation Agent — Mon 12:40 UTC → LUMEN-API
+//     POST /api/v1/internal/campaign-agent/tick. Kill switch
+//     CAMPAIGN_AGENT_DISABLED. Drafts only; approving and sending stay human.
+import "./functions/contentAgentWeekly.js";
+import "./functions/sparkCampaignAgentWeekly.js";
