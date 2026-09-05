@@ -33,7 +33,19 @@ const require = createRequire(import.meta.url);
 const sql = require("mssql");
 
 const HERE = path.resolve(import.meta.dirname, "..");
-const PLATFORM = "C:/dev/iadm/platform-api-septa-octpull";
+// platform-api, wherever it is. The octpull worktree if it exists (it is
+// created off the same line tip and is the one this pack used); otherwise the
+// line checkout, which this script only ever READS and starts — it never
+// writes to it. `--platform <dir>` overrides both.
+const PLATFORM = (() => {
+  const i = process.argv.indexOf("--platform");
+  if (i !== -1) return process.argv[i + 1];
+  for (const dir of ["C:/dev/iadm/platform-api-septa-octpull", "C:/dev/iadm/platform-api-septa"]) {
+    if (fs.existsSync(path.join(dir, "index.js")) && fs.existsSync(path.join(dir, ".env"))) return dir;
+  }
+  console.error("refusing: no platform-api checkout with an index.js and a .env found. Pass --platform <dir>.");
+  process.exit(3);
+})();
 const PORT = 4210;
 const TOKEN = "octpull-agency-sender-exercise-token";
 
