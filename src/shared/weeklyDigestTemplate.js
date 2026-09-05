@@ -11,6 +11,10 @@ const BRAND_PRIMARY = "#FEC82C";
 const BRAND_SLATE = "#1A3A4A";
 const TEXT_MUTED = "#6b7280";
 
+// THE one last resort, imported rather than re-typed. Byte-identical to
+// platform-api's NEUTRAL_BUSINESS_NAME by construction, not by discipline.
+import { NEUTRAL_BUSINESS_NAME } from "./businessIdentity.js";
+
 function esc(s) {
   if (s == null) return "";
   return String(s)
@@ -82,8 +86,24 @@ function statCard(label, value, tone = "default") {
     </td>`;
 }
 
-export function renderWeeklyDigestHtml(digest, tenantName) {
-  const safeTenant = tenantName?.trim() || "Lead Gen";
+export function renderWeeklyDigestHtml(digest, tenantName, agencyName) {
+  // October pull-forward, 2026-09-07 — TWO literals left in this file after
+  // pack 4b fixed the caller, and both of them reached a client's inbox:
+  //
+  //   · `tenantName?.trim() || "Lead Gen"` — pack 4b's note says the
+  //     "Lead Gen" fallback is gone. It is gone from the SENDER, which now
+  //     resolves the business name properly; this copy of it survived here,
+  //     one function call away, and would have addressed a business by our
+  //     internal product name the moment the resolver returned an empty
+  //     string.
+  //   · the footer, which signed every digest "Intelligent Analytics" in
+  //     hard-typed text.
+  //
+  // Both are arguments now. The last resorts are the platform's ONE neutral
+  // name, so an unresolvable name reads as generic rather than as somebody
+  // else's brand — and neither of them is a product codename.
+  const safeTenant = tenantName?.trim() || NEUTRAL_BUSINESS_NAME;
+  const safeAgency = agencyName?.trim() || NEUTRAL_BUSINESS_NAME;
   const windowLabel = fmtWindow(digest?.window);
   const runsCount = digest?.runs_count || 0;
   const skipped = digest?.runs_skipped_count || 0;
@@ -153,7 +173,7 @@ export function renderWeeklyDigestHtml(digest, tenantName) {
           </p>
         </td></tr>
       </table>
-      <p style="margin:16px 0 0 0;font-size:11px;color:${TEXT_MUTED};">Intelligent Analytics · ${esc(new Date().getUTCFullYear())}</p>
+      <p style="margin:16px 0 0 0;font-size:11px;color:${TEXT_MUTED};">${esc(safeAgency)} · ${esc(new Date().getUTCFullYear())}</p>
     </td></tr>
   </table>
 </body></html>`;

@@ -24,7 +24,11 @@
 //   IADM_WEBHOOK_KEY             — shared secret header.
 //   IADM_WEBHOOKS_EMAIL_SEND_PATH (optional, default /api/acs/email/send)
 //   LEADGEN_DIGEST_FROM_EMAIL    — optional override; falls back to ACS default.
-//   LEADGEN_DIGEST_FROM_NAME     — optional display name.
+//   LEADGEN_DIGEST_FROM_NAME     — optional operator OVERRIDE for the sender
+//                                  display name. Unset (every environment
+//                                  today) the agency's own name is resolved
+//                                  through platform-api's business identity;
+//                                  see shared/agencyIdentity.js.
 //
 // The owner lookup, the suppression chain and the ACS send are EXPORTED: the
 // 2-business-day pre-run notice (leadgenScheduler.js) is the same email to the
@@ -34,6 +38,7 @@
 // IMPORTANT — parameterized SQL only. No tenant-supplied strings in queries.
 
 import { canSend, GateUnavailable } from "./notificationGate.js";
+import { agencyDisplayName } from "./agencyIdentity.js";
 import mssqlDefault from "mssql";
 import {
   buildWeeklyDigestForTenant,
@@ -130,7 +135,20 @@ export async function sendViaWebhook({ to, subject, html, text, tenantId, log, s
   const path = (process.env.IADM_WEBHOOKS_EMAIL_SEND_PATH || EMAIL_PATH_DEFAULT).trim();
   const url = `${base.replace(/\/$/, "")}${path.startsWith("/") ? "" : "/"}${path}`.replace(/\/\/api\//, "/api/");
   const fromEmail = (process.env.LEADGEN_DIGEST_FROM_EMAIL || "").trim() || undefined;
-  const fromName = (process.env.LEADGEN_DIGEST_FROM_NAME || "Intelligent Analytics").trim() || undefined;
+  // October pull-forward, 2026-09-07 — the AGENCY's name, resolved, not typed.
+  //
+  // This was `LEADGEN_DIGEST_FROM_NAME || "Intelligent Analytics"`. The
+  // direction was right (a digest about a client's leads is sent BY the agency
+  // TO the client) but the name was a literal, so a second agency running this
+  // platform would sign its own clients' mail with OUR company name. Same
+  // defect pack 4b removed from eleven client name chains, one step up.
+  //
+  // LEADGEN_DIGEST_FROM_NAME still wins when it is set: it is an operator
+  // override for a specific campaign, not a fallback chain. When it is not
+  // set — which is every environment today — the name comes from the one
+  // business-identity resolver, for the agency's own tenant.
+  const fromName = (process.env.LEADGEN_DIGEST_FROM_NAME || "").trim()
+    || (await agencyDisplayName());
   const tenantHeader = (process.env.TENANT_ID_HEADER || "x-tenant-id").trim();
 
   const body = {
@@ -234,7 +252,11 @@ export async function runWeeklyDigestTick(servicesPool, log = () => {}, opts = {
       // failure as the "Intelligent Analytics" fallback pack 1 removed from
       // LUMEN, and in a client-facing email either way.
       const tenantName = await businessDisplayName(t.tenant_id);
-      const rendered = renderWeeklyDigestHtml(digest, tenantName);
+      // The footer signs the email as the AGENCY, the heading names the
+      // CLIENT. Both were literals in the template until 2026-09-07; both are
+      // resolved now, and both are cached for the whole run (one call each).
+      const agencyName = await agencyDisplayName();
+      const rendered = renderWeeklyDigestHtml(digest, tenantName, agencyName);
 
       if (dryRun) {
         log(`[leadgen-digest] DRY-RUN tenant=${t.tenant_id} to=${owner.email} subject="${rendered.subject}" htmlBytes=${rendered.html.length}`);
