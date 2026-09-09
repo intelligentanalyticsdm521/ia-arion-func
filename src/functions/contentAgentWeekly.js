@@ -19,37 +19,43 @@
 // §35 rollback plan: flip the switch and the manual workflow continues
 // untouched, zero data loss.
 
-// ⚠ ENDPOINT NOT YET ON release/sept-a-2026 (checked 2026-09-03).
-// arion-api POST /internal/content-agent-tick does not exist on the arion-api
-// integration line: the whole ARION Content & Social Agent — lib/contentAgent/,
-// routes/arion/contentAgent.js and the routes/internal.js mount — is still
-// UNCOMMITTED in the C:/dev/iadm/arion-api working copy (branch reconciliation
-// 2026-09-04, D-3). Until that session commits and its branch merges, this
-// timer POSTs a 404 every Monday and logs "tick HTTP 404" — no throw, no
-// retry storm, no data touched. The timer is registered now rather than held
-// back so the schedule ships with the rest of the release and the only thing
-// left to land is the API half.
+// THE ENDPOINT IS ON THE LINE AS OF 2026-09-08. It was not when this timer was
+// first registered: the whole ARION Content & Social Agent sat uncommitted in
+// the C:/dev/iadm/arion-api working copy (branch reconciliation 2026-09-04,
+// D-3), so this fired into a 404 every Monday - no throw, no retry storm, no
+// data touched. arion-api branch feat/content-agent-takeover lands
+// lib/contentAgent/, routes/arion/contentAgent.js, the routes/internal.js mount
+// and migrations 063/064; the tick answers for real once that merges.
 //
-// Its sibling sparkCampaignAgentWeekly.js has no such gap: LUMEN-API
-// src/routes/campaignAgent.js:358 already mounts
+// Its sibling sparkCampaignAgentWeekly.js never had that gap: LUMEN-API
+// src/routes/campaignAgent.js:358 mounts
 // POST /api/v1/internal/campaign-agent/tick on the line.
+//
+// BOTH PATHS AND BOTH SCHEDULES ARE EXPORTED CONSTANTS, pinned by
+// test/agent-timers.test.mjs. A path spelled inline in a fetch template is a
+// path nothing can check, and a 404 every Monday is exactly the failure that
+// looks like nothing at all.
 
 import { app } from "@azure/functions";
 
-const SCHEDULE = "0 41 5 * * Mon";
+export const CONTENT_AGENT_SCHEDULE = "0 41 5 * * Mon";
+export const CONTENT_AGENT_TICK_PATH = "/internal/content-agent-tick";
+export const CONTENT_AGENT_KILL_SWITCH = "CONTENT_AGENT_DISABLED";
+
+const SCHEDULE = CONTENT_AGENT_SCHEDULE;
 
 app.timer("contentAgentWeekly", {
   schedule: SCHEDULE,
   runOnStartup: false,
   handler: async (timer, context) => {
     const log = (m) => context.log(`[content-agent] ${m}`);
-    if (process.env.CONTENT_AGENT_DISABLED === "true") { log("disabled via CONTENT_AGENT_DISABLED"); return; }
+    if (process.env[CONTENT_AGENT_KILL_SWITCH] === "true") { log(`disabled via ${CONTENT_AGENT_KILL_SWITCH}`); return; }
     const base = (process.env.ARION_API_BASE_URL || "").replace(/\/+$/, "");
     const key = process.env.ARION_INGEST_KEY || "";
     if (!base) { log("ARION_API_BASE_URL not set — skipping"); return; }
     log(`starting (schedule=${SCHEDULE})`);
     try {
-      const res = await fetch(`${base}/internal/content-agent-tick`, {
+      const res = await fetch(`${base}${CONTENT_AGENT_TICK_PATH}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-arion-ingest-key": key },
       });

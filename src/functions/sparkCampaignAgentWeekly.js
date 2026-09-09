@@ -22,21 +22,27 @@
 
 import { app } from "@azure/functions";
 
-const SCHEDULE = "0 40 12 * * Mon";
+// The path LUMEN-API actually mounts, verified on release/sept-a-2026
+// (src/routes/campaignAgent.js:358, behind requireInternalServiceToken).
+export const CAMPAIGN_AGENT_SCHEDULE = "0 40 12 * * Mon";
+export const CAMPAIGN_AGENT_TICK_PATH = "/api/v1/internal/campaign-agent/tick";
+export const CAMPAIGN_AGENT_KILL_SWITCH = "CAMPAIGN_AGENT_DISABLED";
+
+const SCHEDULE = CAMPAIGN_AGENT_SCHEDULE;
 
 app.timer("sparkCampaignAgentWeekly", {
   schedule: SCHEDULE,
   runOnStartup: false,
   handler: async (timer, context) => {
     const log = (m) => context.log(`[spark-campaign-agent] ${m}`);
-    if (process.env.CAMPAIGN_AGENT_DISABLED === "true") { log("disabled via CAMPAIGN_AGENT_DISABLED"); return; }
+    if (process.env[CAMPAIGN_AGENT_KILL_SWITCH] === "true") { log(`disabled via ${CAMPAIGN_AGENT_KILL_SWITCH}`); return; }
     const base = (process.env.LUMEN_API_BASE_URL || "").replace(/\/+$/, "");
     const key = process.env.LUMEN_INTERNAL_SERVICE_TOKEN || "";
     if (!base) { log("LUMEN_API_BASE_URL not set — skipping"); return; }
     if (!key) { log("LUMEN_INTERNAL_SERVICE_TOKEN not set — skipping (the endpoint fail-closes anyway)"); return; }
     log(`starting (schedule=${SCHEDULE})`);
     try {
-      const res = await fetch(`${base}/api/v1/internal/campaign-agent/tick`, {
+      const res = await fetch(`${base}${CAMPAIGN_AGENT_TICK_PATH}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-internal-token": key },
       });
