@@ -60,6 +60,7 @@ import { renderTemplate } from "./leadgenNoticeTemplate.js";
 import { businessDisplayName } from "./businessIdentity.js";
 import { resolveTenantOwner, isEmailAllowed, sendViaWebhook } from "./weeklyDigestSender.js";
 import { getPlatformPool } from "./platformPool.js";
+import { checkOwnership, ownershipSummary, ownedJsonOrNull } from "./productOwnership.js";
 
 // We accept an optional `mssql` instance as the THIRD arg so the verify
 // script (running under LUMEN-API's node_modules) can pass its own copy
@@ -79,11 +80,28 @@ const PORTAL_BASE = (process.env.PUBLIC_PORTAL_URL || "https://portal.intelligen
  * @param log              — `(msg) => void` for context.log forwarding
  * @returns                — { scanned, fired, paused, skipped, errors[] }
  */
-export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssqlDefault) {
+export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssqlDefault, opts = {}) {
   const summary = { scanned: 0, fired: 0, paused: 0, skipped: 0, errors: [] };
+  const ownership = opts.ownership || ((product, ids) => checkOwnership(product, ids, { mssql }));
+
+  // Access follows the subscription (scope 2026-10-07 §4.3): no lead search
+  // is queued (and nothing billed) for a business whose SPARK has ended. Its
+  // schedules are left exactly as they are, so a re-subscribe carries on.
+  // Filtered IN the statement, so an ended business's schedules, which stay
+  // due, cannot fill the TOP (@limit) and starve paying businesses.
+  // Unknown = every business, exactly as before.
+  const dueTenants = await pool.request().query(`
+    SELECT DISTINCT tenant_id FROM lumen.search_profile
+     WHERE is_scheduled = 1
+       AND next_run_at IS NOT NULL
+       AND next_run_at <= SYSUTCDATETIME()`);
+  const verdict = await ownership("spark", dueTenants.recordset.map((r) => r.tenant_id));
+  summary.productOff = ownershipSummary(verdict);
+  for (const s of summary.productOff.skipped) log(`[leadgen-schedule] business ${s.tenantId}: ${s.note}`);
 
   const dueR = await pool.request()
     .input("limit", mssql.Int, MAX_DISPATCH_PER_TICK)
+    .input("owned", mssql.NVarChar(mssql.MAX), ownedJsonOrNull(verdict))
     .query(`
       SELECT TOP (@limit)
              id, tenant_id, profile_name,
@@ -93,6 +111,7 @@ export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssq
        WHERE is_scheduled = 1
          AND next_run_at IS NOT NULL
          AND next_run_at <= SYSUTCDATETIME()
+         AND (@owned IS NULL OR tenant_id IN (SELECT [value] FROM OPENJSON(@owned)))
        ORDER BY next_run_at ASC`);
 
   summary.scanned = dueR.recordset.length;
@@ -193,7 +212,17 @@ export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDef
     catch (e) { log(`[leadgen-notice] platform DB unreachable: ${e.message} — no notices this tick`); return out; }
   }
 
+  // Access follows the subscription (scope 2026-10-07 §4.3): a business whose
+  // SPARK has ended is not told a lead search is coming, because none will
+  // run. Asked of the pool this pass already holds. Unknown = as before.
+  const ownership = opts.ownership
+    || ((product, ids) => checkOwnership(product, ids, { getPlatformPool: async () => platformPool, mssql }));
+  const verdict = await ownership("spark", [...new Set(dueR.recordset.map((r) => String(r.tenant_id)))]);
+  const runFor = new Set(verdict.owned.map((id) => String(id).toUpperCase()));
+  out.productOff = ownershipSummary(verdict);
+
   for (const row of dueR.recordset) {
+    if (!runFor.has(String(row.tenant_id).toUpperCase())) continue;
     const tz = row.schedule_timezone || "America/Chicago";
     if (!isWithinBusinessDays(now, row.next_run_at, NOTICE_BUSINESS_DAYS, tz)) continue;
     out.scanned++;
