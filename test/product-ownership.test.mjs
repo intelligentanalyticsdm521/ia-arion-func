@@ -60,7 +60,21 @@ function fakePlatform({ rows = {}, fail = null } = {}) {
   };
 }
 const STANDARD_ROWS = { [ON]: { on: true }, [OFF]: { row: true }, [NEVER]: {}, [OWNER]: { kind: "platform_owner" } };
-const ownershipOver = (platform, log) => (product, ids) => checkOwnership(product, ids, { getPlatformPool: async () => platform, log });
+/** platform-api's entitlement payload: `paid` ids have SPARK in Stripe; `down` = unreachable; else decided, not owned. */
+function fakeEntitlements({ paid = [], down = false } = {}) {
+  const asked = [];
+  const fn = async (id) => {
+    asked.push(String(id).toUpperCase());
+    if (down) return null;
+    const owned = paid.map((x) => x.toUpperCase()).includes(String(id).toUpperCase());
+    return { decided: true, products: { spark: { owned, decided: true } } };
+  };
+  fn.asked = asked;
+  return fn;
+}
+const DECIDED_OFF = fakeEntitlements();
+const ownershipOver = (platform, log, getEntitlements = DECIDED_OFF) => (product, ids) =>
+  checkOwnership(product, ids, { getPlatformPool: async () => platform, log, getEntitlements });
 const ownershipUnreachable = (log) => (product, ids) =>
   checkOwnership(product, ids, { getPlatformPool: async () => { throw new Error("connect ETIMEDOUT"); }, log });
 
@@ -100,7 +114,7 @@ test.beforeEach(() => clearOwnershipCache());
 
 test("filterOwned: on, switched off, never bought, platform owner, missing", async () => {
   const log = quietLog();
-  const v = await filterOwned(fakePlatform({ rows: STANDARD_ROWS }), "spark", [ON, OFF, NEVER, OWNER, GHOST], { log });
+  const v = await filterOwned(fakePlatform({ rows: STANDARD_ROWS }), "spark", [ON, OFF, NEVER, OWNER, GHOST], { log, getEntitlements: DECIDED_OFF });
   assert.deepEqual(v.owned, [ON, OWNER, GHOST]);
   assert.deepEqual(v.off.map((o) => o.tenantId), [OFF, NEVER]);
   assert.equal(v.off[0].reason, "SPARK is switched off");
@@ -153,7 +167,7 @@ test("dispatch: SPARK off → no lead search queued for that business, filtered 
   assert.equal(summary.scanned, 1);
   assert.deepEqual(reread, [101], "only the paying business's schedule goes on to dispatch");
   assert.deepEqual(summary.productOff.skipped.map((s) => s.tenantId), [OFF]);
-  assert.ok(logs.some((m) => m.includes(OFF) && m.includes("nothing was run")));
+  assert.ok(logs.some((m) => m.includes(OFF) && m.includes("SPARK has ended for this business, so no scheduled lead search was started. It starts again after a re-subscribe.")));
 });
 
 test("dispatch: platform database unreachable → every schedule dispatched as before", async () => {
@@ -184,6 +198,34 @@ test("notice: SPARK off → that business is not told a run is coming", async ()
   const out = await notice(ownershipOver(fakePlatform({ rows: STANDARD_ROWS }), quietLog()));
   assert.equal(out.scanned, 1, "only the paying business is considered for a notice");
   assert.deepEqual(out.productOff.skipped.map((s) => s.tenantId), [OFF]);
+});
+
+test("F1: row off but Stripe shows SPARK paid for → the scheduled search still runs (the SPARK gate lets it in)", async () => {
+  const ent = fakeEntitlements({ paid: [OFF] });
+  const { summary, reread } = await dispatch(ownershipOver(fakePlatform({ rows: STANDARD_ROWS }), quietLog(), ent));
+  assert.deepEqual(reread.sort(), [101, 202], "both schedules dispatch");
+  assert.deepEqual(summary.productOff.skipped, []);
+  assert.deepEqual(ent.asked, [OFF], "only the business whose row says off is asked");
+});
+
+test("F1: platform-api unreachable → the business whose row says off runs as before, logged", async () => {
+  const log = quietLog();
+  const v = await filterOwned(fakePlatform({ rows: { [OFF]: { row: true } } }), "spark", [OFF], { log, getEntitlements: fakeEntitlements({ down: true }) });
+  assert.deepEqual(v.owned, [OFF]);
+  assert.deepEqual(v.unconfirmed, [OFF]);
+  assert.ok(log.lines.error.some((l) => /could not confirm/.test(l)));
+});
+
+test("F1: fetchEntitlements asks /internal/entitlements/:id with the token, and is null when not configured or failing", async () => {
+  const seen = [];
+  const fetchImpl = async (url, init) => { seen.push({ url, token: init.headers["x-internal-token"] }); return { ok: true, json: async () => ({ decided: true }) }; };
+  const env = { PLATFORM_API_URL: "http://platform.test/", PLATFORM_INTERNAL_TOKEN: "t0k" };
+  assert.deepEqual(await own.fetchEntitlements(OFF, { env, fetchImpl }), { decided: true });
+  assert.equal(seen[0].url, `http://platform.test/internal/entitlements/${OFF}`);
+  assert.equal(seen[0].token, "t0k");
+  assert.equal(await own.fetchEntitlements(OFF, { env: {}, fetchImpl }), null);
+  assert.equal(await own.fetchEntitlements(OFF, { env, fetchImpl: async () => ({ ok: false }) }), null);
+  assert.equal(await own.fetchEntitlements(OFF, { env, fetchImpl: async () => { throw new Error("ECONNREFUSED"); } }), null);
 });
 
 test("notice: platform database unreachable → every business considered as before", async () => {

@@ -14,6 +14,15 @@
 // because a verify script can hand this file a pool from LUMEN's own mssql
 // copy (the dual-mssql gotcha leadgenScheduler.js describes).
 //
+// SPARK: THE ROW FIRST, PLATFORM-API SECOND (as in LUMEN's copy). The SPARK
+// gate answers from platform-api, which counts a live Stripe SPARK item as
+// owned even when the row is off or missing (platform-api lib/entitlements.js
+// `owned = !!dbRow || !!stripeTier`). So a row that says "off" is only a
+// question: each such business is asked of platform-api's
+// /internal/entitlements/:id, and only a DECIDED "not owned" stops its lead
+// searches. Unreachable, undecided or "Stripe shows SPARK" keeps it running,
+// logged at error (review 2026-10-08, finding 1).
+//
 // THE ANSWER comes from the same table every product gate reads:
 // iadm_platform core.tenant_services (+ core.services, core.tenants).
 //   ON   = a row for the product with is_enabled = 1 on an active service, or
@@ -35,6 +44,7 @@
 // CACHE: decided answers only, 60 seconds per product and business. A failure is
 // never cached, so the next tick asks again.
 import sql from "mssql";
+import { platformApiUrl, platformInternalToken } from "./platformEnv.js";
 
 export const UNDECIDED_RUNS_AS_BEFORE = true;
 export const CACHE_TTL_MS = 60 * 1000;
@@ -42,6 +52,37 @@ export const CACHE_TTL_MS = 60 * 1000;
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const KEPT_KINDS = new Set(["platform_owner", "agency"]);
 const PRODUCT_NAMES = { oliver: "OLIVER", stella: "STELLA", spark: "SPARK", arion: "ARION" };
+// The gates read their service key from these settings (requireOliverAccess,
+// requireStellaAccess, requireArionAccess). The copy must read the same one,
+// or a set variable would read every business as "not part of the plan".
+const SERVICE_KEY_ENV = { oliver: "OLIVER_SERVICE_KEY", stella: "STELLA_SERVICE_KEY", arion: "ARION_SERVICE_KEY" };
+// Products whose gate answers from platform-api (Stripe folded in), not the row.
+const CONFIRM_WITH_PLATFORM = new Set(["spark"]);
+
+/**
+ * platform-api's entitlement payload for one business (the answer LUMEN's SPARK
+ * gate uses), or null when it is not configured, unreachable or not 200.
+ * Never throws.
+ */
+export async function fetchEntitlements(tenantId, { env = process.env, fetchImpl = globalThis.fetch, timeoutMs = 4000 } = {}) {
+  const base = platformApiUrl(env);
+  const tok = platformInternalToken(env);
+  if (!base || !tok || typeof fetchImpl !== "function") return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(`${base}/internal/entitlements/${encodeURIComponent(tenantId)}`, {
+      method: "GET", headers: { "x-internal-token": tok }, signal: controller.signal,
+    });
+    if (!res || !res.ok) return null;
+    return (await res.json()) || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const defaultGetEntitlements = (tenantId) => fetchEntitlements(tenantId);
 
 const _cache = new Map(); // `${product}:${TENANTID}` -> { at, on, reason }
 
@@ -51,9 +92,26 @@ export function clearOwnershipCache() { _cache.clear(); }
 const norm = (v) => String(v || "").trim().toUpperCase();
 export const productName = (product) => PRODUCT_NAMES[String(product).toLowerCase()] || String(product).toUpperCase();
 
-/** The sentence a runner's summary carries for a business it left out. */
-export function skipSentence(product, reason) {
-  return `${productName(product)} is off for this business (${reason}), so nothing was run for it.`;
+/** The core.services.service_key the product's gate reads (env override, as the gate does). */
+export function serviceKeyFor(product, env = process.env) {
+  const key = String(product || "").trim().toLowerCase();
+  const name = SERVICE_KEY_ENV[key];
+  const v = name ? String(env?.[name] || "").trim() : "";
+  return (v || key).toLowerCase();
+}
+
+/**
+ * The sentence a runner's summary carries for a business it left out: which
+ * product, what did not happen, and what brings it back.
+ *   ended=true  -> "SPARK has ended for this business, so the Responder did not
+ *                  answer this lead. It starts again after a re-subscribe."
+ *   ended=false -> "SPARK isn't part of this business's plan, so ..."
+ */
+export function skipSentence(product, ended, did = "nothing was run for it") {
+  const p = productName(product);
+  return ended
+    ? `${p} has ended for this business, so ${did}. It starts again after a re-subscribe.`
+    : `${p} isn't part of this business's plan, so ${did}.`;
 }
 
 /**
@@ -72,10 +130,11 @@ export function skipSentence(product, reason) {
  * @param {object} [deps]  { log, now } test seams
  */
 export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
-  const { log = console, now = Date.now, mssql = sql } = deps;
+  const { log = console, now = Date.now, mssql = sql, env = process.env } = deps;
   const key = String(product || "").trim().toLowerCase();
+  const serviceKey = serviceKeyFor(key, env);
   const passed = [...(tenantIds || [])];
-  const out = { product: key, owned: [], off: [], unknown: [], undecided: false, error: null };
+  const out = { product: key, owned: [], off: [], unknown: [], unconfirmed: [], undecided: false, error: null };
   if (!passed.length) return out;
 
   const asked = [...new Set(passed.map(norm).filter((id) => GUID_RE.test(id)))];
@@ -83,7 +142,7 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
   const t = now();
   const toRead = [];
   for (const id of asked) {
-    const hit = _cache.get(`${key}:${id}`);
+    const hit = _cache.get(`${serviceKey}:${id}`);
     if (hit && t - hit.at < CACHE_TTL_MS) verdict.set(id, hit);
     else toRead.push(id);
   }
@@ -94,7 +153,7 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
       if (!platformPool || typeof platformPool.request !== "function") throw new Error("no platform database connection");
       const r = await platformPool.request()
         .input("ids", mssql.NVarChar(mssql.MAX), JSON.stringify(toRead))
-        .input("product", mssql.NVarChar(100), key)
+        .input("product", mssql.NVarChar(100), serviceKey)
         .query(`
           SELECT t.tenant_id, t.tenant_kind,
                  CAST(CASE WHEN EXISTS (
@@ -121,16 +180,44 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
       out.off = passed.map((tenantId) => ({ tenantId, reason: "could not be checked" }));
       return out;
     }
+    const toConfirm = [];
     for (const row of rows) {
       const id = norm(row.tenant_id);
       const kind = String(row.tenant_kind || "").trim().toLowerCase();
       let v;
       if (KEPT_KINDS.has(kind)) v = { on: true, reason: kind };
       else if (row.has_on === true || row.has_on === 1) v = { on: true, reason: "switched on" };
-      else if (row.has_row === true || row.has_row === 1) v = { on: false, reason: `${productName(key)} is switched off` };
-      else v = { on: false, reason: `${productName(key)} is not part of this business's plan` };
+      else if (row.has_row === true || row.has_row === 1) v = { on: false, ended: true, reason: `${productName(key)} is switched off` };
+      else v = { on: false, ended: false, reason: `${productName(key)} is not part of this business's plan` };
+      if (!v.on && CONFIRM_WITH_PLATFORM.has(key)) { toConfirm.push([id, v]); continue; }
       verdict.set(id, v);
-      _cache.set(`${key}:${id}`, { at: t, ...v });
+      _cache.set(`${serviceKey}:${id}`, { at: t, ...v });
+    }
+    // The row says off. Ask the answer the SPARK gate uses before stopping
+    // anything. Only a decided "not owned" is off; anything else runs as before.
+    if (toConfirm.length) {
+      const getEnt = deps.getEntitlements || defaultGetEntitlements;
+      await Promise.all(toConfirm.map(async ([id, v]) => {
+        let payload = null;
+        try { payload = await getEnt(id); } catch { payload = null; }
+        const node = payload?.products?.[key] || null;
+        if (!payload || payload.decided === false || !node || node.decided === false) {
+          out.unconfirmed.push(id);
+          return; // no verdict: kept below, never cached
+        }
+        const owns = typeof node.active === "boolean" ? node.active : node.owned === true;
+        const final = owns ? { on: true, reason: "paid for in Stripe" } : v;
+        if (owns) {
+          log.error?.("[productOwnership]",
+            `${productName(key)} is switched off on ${id}'s row but Stripe shows it paid for; ran for it. The entitlement sync should switch the row on.`);
+        }
+        verdict.set(id, final);
+        _cache.set(`${serviceKey}:${id}`, { at: t, ...final });
+      }));
+      if (out.unconfirmed.length) {
+        log.error?.("[productOwnership]",
+          `could not confirm with platform-api that ${productName(key)} has ended for ${out.unconfirmed.length} business(es); ran for them as before: ${out.unconfirmed.join(", ")}`);
+      }
     }
   }
 
@@ -138,14 +225,14 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
     const id = norm(original);
     const v = verdict.get(id);
     if (!v) {
-      // Missing from core.tenants, or not an id at all: we do not know, so we
-      // do not take it away.
-      out.unknown.push(original);
+      // Missing from core.tenants, not an id at all, or SPARK's off could not
+      // be confirmed: we do not know, so we do not take it away.
+      if (!out.unconfirmed.includes(id)) out.unknown.push(original);
       out.owned.push(original);
       continue;
     }
     if (v.on) out.owned.push(original);
-    else out.off.push({ tenantId: original, reason: v.reason });
+    else out.off.push({ tenantId: original, reason: v.reason, ended: !!v.ended });
   }
   if (out.unknown.length) {
     log.error?.("[productOwnership]",
@@ -172,7 +259,7 @@ export async function checkOwnership(product, tenantIds, deps = {}) {
     pool = null;
     log.error?.("[productOwnership]", `platform database unavailable: ${e.message}`);
   }
-  const verdict = await filterOwned(pool, product, tenantIds, { log, ...(deps.mssql ? { mssql: deps.mssql } : {}) });
+  const verdict = await filterOwned(pool, product, tenantIds, { log, getEntitlements: deps.getEntitlements, env: deps.env, ...(deps.mssql ? { mssql: deps.mssql } : {}) });
   if (verdict.off.length) {
     log.log?.("[productOwnership]",
       `${productName(product)} is off for ${verdict.off.length} business(es), so nothing was run for them: ${verdict.off.map((o) => `${o.tenantId} (${o.reason})`).join(", ")}`);
@@ -198,16 +285,19 @@ export function ownedJsonOrNull(verdict) {
 
 /**
  * What a runner's summary says about the check, in one object:
- *   { product, checked, skipped: [{ tenantId, reason, note }], undecided, error }
+ *   { product, skipped: [{ tenantId, reason, ended, note }], undecided, error, unknown, unconfirmed }
+ * `did` names what this runner did not do ("the Responder did not answer this
+ * lead"), so the note says which job stopped and what brings it back.
  */
-export function ownershipSummary(verdict) {
+export function ownershipSummary(verdict, did) {
   return {
     product: verdict.product,
-    skipped: verdict.off.map((o) => ({ tenantId: o.tenantId, reason: o.reason, note: skipSentence(verdict.product, o.reason) })),
+    skipped: verdict.off.map((o) => ({ tenantId: o.tenantId, reason: o.reason, ended: !!o.ended, note: skipSentence(verdict.product, !!o.ended, did) })),
     undecided: verdict.undecided,
     error: verdict.error,
     unknown: verdict.unknown,
+    unconfirmed: verdict.unconfirmed || [],
   };
 }
 
-export default { filterOwned, checkOwnership, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull };
+export default { filterOwned, checkOwnership, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };

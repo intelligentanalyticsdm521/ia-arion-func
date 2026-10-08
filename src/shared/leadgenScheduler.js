@@ -96,7 +96,7 @@ export async function runLeadgenScheduledTick(pool, log = () => {}, mssql = mssq
        AND next_run_at IS NOT NULL
        AND next_run_at <= SYSUTCDATETIME()`);
   const verdict = await ownership("spark", dueTenants.recordset.map((r) => r.tenant_id));
-  summary.productOff = ownershipSummary(verdict);
+  summary.productOff = ownershipSummary(verdict, "no scheduled lead search was started");
   for (const s of summary.productOff.skipped) log(`[leadgen-schedule] business ${s.tenantId}: ${s.note}`);
 
   const dueR = await pool.request()
@@ -219,7 +219,7 @@ export async function runPreRunNoticePass(pool, log = () => {}, mssql = mssqlDef
     || ((product, ids) => checkOwnership(product, ids, { getPlatformPool: async () => platformPool, mssql }));
   const verdict = await ownership("spark", [...new Set(dueR.recordset.map((r) => String(r.tenant_id)))]);
   const runFor = new Set(verdict.owned.map((id) => String(id).toUpperCase()));
-  out.productOff = ownershipSummary(verdict);
+  out.productOff = ownershipSummary(verdict, "no \"your lead search runs in two days\" notice was sent");
 
   for (const row of dueR.recordset) {
     if (!runFor.has(String(row.tenant_id).toUpperCase())) continue;
