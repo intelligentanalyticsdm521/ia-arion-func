@@ -15,6 +15,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+// Most tests below are about what a timer does ONCE the switch is on: every
+// stop waits for ENTITLEMENT_SYNC_MODE to be exactly 'apply' (decision (a),
+// 2026-10-08). The dry-run half (mode unset: everything runs as before) is at
+// the end of this file and passes the mode explicitly. node --test runs each
+// file in its own process, so this does not leak.
+process.env.ENTITLEMENT_SYNC_MODE = "apply";
 process.env.SQL_SERVER = "";
 process.env.SERVICES_SQL_SERVER = "";
 
@@ -241,4 +247,40 @@ test("both passes default to the real check (no stub on the seam)", async () => 
   assert.match(src, /opts\.ownership\s+\|\| \(\(product, ids\) => checkOwnership\(product, ids, \{ getPlatformPool: async \(\) => platformPool, mssql \}\)\)/);
   const lib = readFileSync(new URL("../src/shared/productOwnership.js", import.meta.url), "utf8");
   assert.match(lib, /import\("\.\/platformPool\.js"\)\)\.getPlatformPool/);
+});
+
+/* ── decision (a): nothing stops before ENTITLEMENT_SYNC_MODE=apply ─────── */
+
+// Production already has rows off (Briarwood Dental, Midwest Ag Services). On
+// push day, with the mode unset, the scheduled lead searches and the two-day
+// notices must behave exactly as before the stream. PRESENCE: the ended
+// business IS dispatched and IS considered for its notice.
+const ownershipWithMode = (env) => (product, ids) =>
+  checkOwnership(product, ids, { getPlatformPool: async () => fakePlatform({ rows: STANDARD_ROWS }), log: quietLog(), getEntitlements: DECIDED_OFF, env });
+
+test("timerStopsLive: only the exact word 'apply' lets a timer stop", () => {
+  assert.equal(own.timerStopsLive({ ENTITLEMENT_SYNC_MODE: "apply" }), true);
+  for (const v of [undefined, "", "dry_run", "APPLY", " apply", "true"]) {
+    assert.equal(own.timerStopsLive(v === undefined ? {} : { ENTITLEMENT_SYNC_MODE: v }), false, JSON.stringify(v));
+  }
+});
+
+test("dispatch, mode unset: the ended business's schedule is dispatched exactly as before (@owned NULL), listed as held", async () => {
+  const { summary, pool, reread } = await dispatch(ownershipWithMode({}));
+  assert.equal(pool.calls.find((c) => MAIN.test(c.text)).inputs.owned, null);
+  assert.equal(summary.scanned, 2);
+  assert.deepEqual(reread.sort(), [101, 202]);
+  assert.deepEqual(summary.productOff.skipped, []);
+  assert.deepEqual(summary.productOff.held.map((h) => h.tenantId), [OFF]);
+});
+
+test("notice, mode unset: the ended business is considered for its notice as before", async () => {
+  const out = await notice(ownershipWithMode({}));
+  assert.equal(out.scanned, 2);
+  assert.deepEqual(out.productOff.skipped, []);
+});
+
+test("dispatch, mode apply passed explicitly: the ended business is stopped (the switch is not stuck open)", async () => {
+  const { reread } = await dispatch(ownershipWithMode({ ENTITLEMENT_SYNC_MODE: "apply" }));
+  assert.deepEqual(reread, [101]);
 });

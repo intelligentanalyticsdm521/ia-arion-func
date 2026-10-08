@@ -46,6 +46,15 @@
 import sql from "mssql";
 import { platformApiUrl, platformInternalToken } from "./platformEnv.js";
 
+// THE APPLY SWITCH (decision (a), 2026-10-08). A timer stops for an ended
+// business ONLY once the entitlement sync is allowed to write:
+// ENTITLEMENT_SYNC_MODE exactly 'apply', read the way oliver-api
+// lib/entitlementSync.js syncModeFromEnv reads it. Unset, or anything else, is
+// the dry run: the check still runs and logs which businesses WOULD stop, but
+// every business runs exactly as it did before this build. Production already
+// has rows switched off (Briarwood Dental, Midwest Ag Services); nothing
+// changes for them on push day, only after Brandon approves the first apply.
+// ONE place decides it: timerStopsLive(), applied at the end of filterOwned.
 export const UNDECIDED_RUNS_AS_BEFORE = true;
 export const CACHE_TTL_MS = 60 * 1000;
 
@@ -85,6 +94,31 @@ export async function fetchEntitlements(tenantId, { env = process.env, fetchImpl
 const defaultGetEntitlements = (tenantId) => fetchEntitlements(tenantId);
 
 const _cache = new Map(); // `${product}:${TENANTID}` -> { at, on, reason }
+
+/**
+ * May a timer stop for an ended business right now? Only when
+ * ENTITLEMENT_SYNC_MODE is exactly 'apply' (the test oliver-api's
+ * syncModeFromEnv makes).
+ */
+export function timerStopsLive(env = process.env) {
+  return (env || {}).ENTITLEMENT_SYNC_MODE === "apply";
+}
+
+/**
+ * The dry-run half of the switch: before the first apply, a business whose
+ * product is off is still run for, exactly as before. It is listed in `held`
+ * (and logged) so the dry run shows who WOULD stop.
+ */
+function holdUnlessApply(out, passed, { env, log }) {
+  out.mode = timerStopsLive(env) ? "apply" : "dry_run";
+  if (!out.off.length || out.mode === "apply") return out;
+  out.held = out.off;
+  out.off = [];
+  out.owned = [...passed];
+  log.log?.("[productOwnership]",
+    `${productName(out.product)} is off for ${out.held.length} business(es), but timers stop only once ENTITLEMENT_SYNC_MODE is 'apply' (now: dry run), so they ran as before: ${out.held.map((o) => `${o.tenantId} (${o.reason})`).join(", ")}`);
+  return out;
+}
 
 /** Forget cached answers (tests, or a founder who just switched a product back on). */
 export function clearOwnershipCache() { _cache.clear(); }
@@ -134,7 +168,7 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
   const key = String(product || "").trim().toLowerCase();
   const serviceKey = serviceKeyFor(key, env);
   const passed = [...(tenantIds || [])];
-  const out = { product: key, owned: [], off: [], unknown: [], unconfirmed: [], undecided: false, error: null };
+  const out = { product: key, owned: [], off: [], held: [], unknown: [], unconfirmed: [], undecided: false, error: null, mode: timerStopsLive(env) ? "apply" : "dry_run" };
   if (!passed.length) return out;
 
   const asked = [...new Set(passed.map(norm).filter((id) => GUID_RE.test(id)))];
@@ -238,7 +272,7 @@ export async function filterOwned(platformPool, product, tenantIds, deps = {}) {
     log.error?.("[productOwnership]",
       `${out.unknown.length} business(es) not found in the platform database while checking ${productName(key)}; ran for them as before: ${out.unknown.join(", ")}`);
   }
-  return out;
+  return holdUnlessApply(out, passed, { env, log });
 }
 
 /**
@@ -292,7 +326,10 @@ export function ownedJsonOrNull(verdict) {
 export function ownershipSummary(verdict, did) {
   return {
     product: verdict.product,
+    mode: verdict.mode || "dry_run",
     skipped: verdict.off.map((o) => ({ tenantId: o.tenantId, reason: o.reason, ended: !!o.ended, note: skipSentence(verdict.product, !!o.ended, did) })),
+    // Off, but run as before because the mode is not 'apply' yet.
+    held: (verdict.held || []).map((o) => ({ tenantId: o.tenantId, reason: o.reason, ended: !!o.ended })),
     undecided: verdict.undecided,
     error: verdict.error,
     unknown: verdict.unknown,
@@ -300,4 +337,4 @@ export function ownershipSummary(verdict, did) {
   };
 }
 
-export default { filterOwned, checkOwnership, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };
+export default { filterOwned, checkOwnership, timerStopsLive, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };
