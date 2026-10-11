@@ -53,6 +53,7 @@
 import { app } from "@azure/functions";
 import { getPlatformPool } from "../shared/platformPool.js";
 import { getServicesPool } from "../shared/servicesPool.js";
+import { keepRowsOfOwners } from "../shared/productOwnership.js";
 
 const DEFAULT_AGE_DAYS = 14;
 const DEFAULT_SCORE_MIN = 40;
@@ -95,14 +96,22 @@ app.timer("leadgenColdReverify", {
  * platform.lead_cache lives on the platform DB; lumen.search_profile lives
  * on the services DB — so we do a two-hop lookup instead of a cross-DB
  * JOIN.
+ *
+ * SPARK ONLY (FEATURES row 33, 11 Oct 2026): the Pro+ business list is
+ * filtered by SPARK ownership (checkOwnership, apply mode live). A business
+ * whose SPARK has ended is left out, so none of the leads assigned only to it
+ * are touched; undecided runs as before.
+ *
+ * @param {object} [deps] { getServicesPool, getPlatformPool, ownership } test seams
  */
 export async function enqueueColdReverify(
   { dryRun, ageDays, scoreMin, scoreMax, maxPerTick },
   log = () => {},
+  deps = {},
 ) {
   const started = Date.now();
-  const servicesPool = await getServicesPool();
-  const platformPool = await getPlatformPool();
+  const servicesPool = await (deps.getServicesPool || getServicesPool)();
+  const platformPool = await (deps.getPlatformPool || getPlatformPool)();
 
   // 1. Which tenants are Pro+? Read tier from lumen.search_profile — any
   //    tenant with at least one profile at pro/scale/business tier qualifies
@@ -112,8 +121,13 @@ export async function enqueueColdReverify(
       FROM lumen.search_profile
      WHERE tier IN ('pro','scale','business')
   `);
-  const proTenantIds = proTenantsResult.recordset.map((r) => r.tenant_id).filter(Boolean);
-  log(`pro-plus tenant count: ${proTenantIds.length}`);
+  const proListed = proTenantsResult.recordset.map((r) => r.tenant_id).filter(Boolean);
+  const owners = await keepRowsOfOwners("spark", proListed, {
+    tenantOf: (id) => id, ownership: deps.ownership, did: "its cold leads were not re-checked",
+  });
+  for (const s of owners.summary?.skipped || []) log(`business ${s.tenantId}: skipped — ${s.note}`);
+  const proTenantIds = owners.kept;
+  log(`pro-plus tenant count: ${proTenantIds.length}${owners.leftOut.length ? ` (${owners.leftOut.length} left out: SPARK not in the subscription)` : ""}`);
 
   if (proTenantIds.length === 0) {
     return { dryRun, ageDays, scoreMin, scoreMax, candidates: 0, enqueued: 0, durationMs: Date.now() - started };

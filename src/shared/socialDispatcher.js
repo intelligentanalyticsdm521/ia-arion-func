@@ -42,6 +42,7 @@
 
 import { getSecret } from "./secrets.js";
 import { publishers } from "./socialPublishers.js";
+import { keepRowsOfOwners } from "./productOwnership.js";
 
 const LUMEN_API_BASE_URL = (process.env.LUMEN_API_BASE_URL || "").replace(/\/+$/, "");
 const DISPATCH_TOKEN_ENV = "LUMEN_SOCIAL_DISPATCH_TOKEN";
@@ -80,9 +81,20 @@ function pickPlatformBody(post, platform) {
  * never breaks the tick.
  *
  * @param log — `(msg) => void` for context.log forwarding
- * @returns   — { scanned, claimed, published, partial_failure, failed, errors[] }
+ * @param deps — { ownership, fetchImpl, getSecret, publishers } test seams
+ * @returns   — { scanned, claimed, published, partial_failure, failed, left_out, errors[] }
+ *
+ * ARION ONLY (FEATURES row 23, 11 Oct 2026; My Brand lives under ARION): a
+ * claimed post of a business decided NOT to own ARION is left out — nothing is
+ * published and no result is sent back, so the post is not marked done (LUMEN's
+ * stall recovery re-offers it later; a re-subscribe publishes it). Publishing
+ * is a send, so when ownership cannot be checked every claimed post is held
+ * the same way and the next tick asks again.
  */
-export async function runSocialDispatchTick(log = () => {}) {
+export async function runSocialDispatchTick(log = () => {}, deps = {}) {
+  const fetch = deps.fetchImpl || globalThis.fetch;
+  const readSecret = deps.getSecret || getSecret;
+  const publisherFor = deps.publishers || publishers;
   const summary = {
     scanned: 0,
     claimed: 0,
@@ -90,6 +102,8 @@ export async function runSocialDispatchTick(log = () => {}) {
     failed: 0,
     target_published: 0,
     target_failed: 0,
+    left_out: 0,
+    productOff: null,
     errors: [],
   };
 
@@ -134,6 +148,16 @@ export async function runSocialDispatchTick(log = () => {}) {
     return summary;
   }
 
+  const owners = await keepRowsOfOwners("arion", posts, {
+    ownership: deps.ownership, holdWhenUndecided: true, did: "no social post was published",
+  });
+  summary.left_out = owners.leftOut.length;
+  summary.productOff = owners.summary;
+  for (const p of owners.leftOut) {
+    log(`[social-dispatcher] post=${p.post_id} left as it is — ${owners.held ? "could not confirm the ARION subscription" : "ARION is not in this business's subscription"}`);
+  }
+  posts = owners.kept;
+
   // 2. Publish each post's targets and patch the result back.
   for (const post of posts) {
     const postId = post.post_id;
@@ -152,7 +176,7 @@ export async function runSocialDispatchTick(log = () => {}) {
     const targetUpdates = [];
     for (const t of targets) {
       const platform = (t.platform || "").toLowerCase();
-      const publish = publishers[platform];
+      const publish = publisherFor[platform];
       if (!publish) {
         targetUpdates.push({
           platform,
@@ -179,7 +203,7 @@ export async function runSocialDispatchTick(log = () => {}) {
       let accessToken = null;
       if (t.access_token_kv_ref) {
         try {
-          accessToken = await getSecret(t.access_token_kv_ref, t.access_token_kv_ref);
+          accessToken = await readSecret(t.access_token_kv_ref, t.access_token_kv_ref);
         } catch (err) {
           log(`[social-dispatcher] token fetch failed post=${postId} platform=${platform}: ${err.message}`);
         }

@@ -32,6 +32,8 @@
  */
 import sql from "mssql";
 import crypto from "node:crypto";
+import { keepRowsOfOwners, fetchEntitlements } from "./productOwnership.js";
+import { maySpend } from "./entitlementsRule.js";
 
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_PAGES_PER_SITE = 25;
@@ -277,9 +279,16 @@ export async function scanSite(pool, site, log = () => {}) {
 }
 
 /**
- * Run the scan across every site with plugin connectivity.
+ * Run the scan across every site with plugin connectivity whose business owns
+ * ARION AND may spend (FEATURES row 28, 11 Oct 2026). Scoring a page is a
+ * model call through LUMEN, so before ANY call the business's ARION node on
+ * the platform-api payload must pass maySpend: decided and owned. Undecided
+ * refuses the spend (nothing is scored, nothing is written; the next run asks
+ * again). A business whose ARION has ended is left out untouched.
+ *
+ * @param {object} [deps] { ownership, getEntitlements } test seams
  */
-export async function runPageVoiceScoreScan(pool, log = () => {}) {
+export async function runPageVoiceScoreScan(pool, log = () => {}, deps = {}) {
   if (!LUMEN_API_BASE_URL) {
     log("LUMEN_API_BASE_URL not set — skipping tick");
     return { sitesChecked: 0, sitesWritten: 0, skipped: true };
@@ -296,8 +305,35 @@ export async function runPageVoiceScoreScan(pool, log = () => {}) {
       AND wp_app_password_ref IS NOT NULL
     ORDER BY site_id
   `);
-  const sites = sitesResult.recordset;
-  log(`found ${sites.length} site(s) with plugin app-password configured`);
+  const owners = await keepRowsOfOwners("arion", sitesResult.recordset, {
+    ownership: deps.ownership, did: "its pages were not scored against the brand voice",
+  });
+  for (const s of owners.summary?.skipped || []) log(`business ${s.tenantId}: skipped — ${s.note}`);
+
+  // The spend check, once per business, before any model call.
+  const getEnt = deps.getEntitlements || fetchEntitlements;
+  const spendOk = new Map();
+  const spendRefused = [];
+  const sites = [];
+  for (const site of owners.kept) {
+    const key = String(site.tenant_id || "").toUpperCase();
+    if (!spendOk.has(key)) {
+      let payload = null;
+      try { payload = await getEnt(site.tenant_id); } catch { payload = null; }
+      const node = payload?.products?.arion || null;
+      const ok = maySpend(node);
+      spendOk.set(key, ok);
+      if (!ok) {
+        const why = !node || node.decided === false
+          ? "we could not confirm the ARION subscription, so no model call was made"
+          : "ARION is not in this business's subscription";
+        spendRefused.push({ tenantId: site.tenant_id, reason: why });
+        log(`business ${site.tenant_id}: pages not scored — ${why}`);
+      }
+    }
+    if (spendOk.get(key)) sites.push(site);
+  }
+  log(`found ${sitesResult.recordset.length} site(s) with plugin app-password configured; scoring ${sites.length}`);
 
   let totalWritten = 0;
   const errors = [];
@@ -316,6 +352,9 @@ export async function runPageVoiceScoreScan(pool, log = () => {}) {
   return {
     sitesChecked: sites.length,
     sitesWritten: totalWritten,
+    sitesLeftOut: sitesResult.recordset.length - sites.length,
+    productOff: owners.summary,
+    spendRefused,
     errors,
   };
 }

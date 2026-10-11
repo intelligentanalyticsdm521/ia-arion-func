@@ -24,6 +24,7 @@
 import sql from "mssql";
 import crypto from "node:crypto";
 import { projectApi, dataApi } from "./seranking.js";
+import { keepRowsOfOwners } from "./productOwnership.js";
 
 const AUTHORITY_TIER = "authority";
 
@@ -57,6 +58,20 @@ async function listInsightsSites(pool) {
 }
 
 const isAuthority = (site) => String(site.seo_addon_tier || "").toLowerCase() === AUTHORITY_TIER;
+
+// FEATURES row 27 (11 Oct 2026): every Market Monitor job runs only for
+// businesses that own ARION (the SEO add-on lives under ARION). A business
+// whose ARION has ended is left out and none of its rows are touched, so a
+// re-subscribe picks up where it stopped. Undecided runs as before.
+// NOT YET: the add-on tier itself is still the cached arion.site.seo_addon_tier
+// column, because platform-api's entitlement payload carries no SEO add-on node.
+async function onlyArionOwners(sites, deps, log, job) {
+  const owners = await keepRowsOfOwners("arion", sites, {
+    ownership: deps.ownership, did: `no Market Monitor ${job} were captured`,
+  });
+  for (const s of owners.summary?.skipped || []) log(`[${job}] business ${s.tenantId}: skipped — ${s.note}`);
+  return owners;
+}
 
 async function logJobStart(pool, tenantId, siteId, jobName) {
   const r = await pool.request()
@@ -183,7 +198,7 @@ export async function mergePositionRows(pool, rows) {
 // ══════════════════════════════════════════════════════════════
 // JOB 1: Competitor Moves — daily position capture
 // ══════════════════════════════════════════════════════════════
-export async function runMovesCapture(pool, log) {
+export async function runMovesCapture(pool, log, deps = {}) {
   // listAuthoritySites and logJobStart both used to sit OUTSIDE any try. A
   // failure in either threw straight out of the caller having written no
   // job_log row at all — which is exactly what production shows: the timer has
@@ -203,6 +218,8 @@ export async function runMovesCapture(pool, log) {
     e.message = `listInsightsSites failed (before any job_log row could be written): ${e.message}`;
     throw e;
   }
+  const owners = await onlyArionOwners(sites, deps, log, "moves");
+  sites = owners.kept;
 
   log(`[moves] processing ${sites.length} project site(s) (${sites.filter(isAuthority).length} Authority-tier)`);
 
@@ -357,14 +374,14 @@ export async function runMovesCapture(pool, log) {
     }
   }
 
-  return { sitesProcessed: sites.length, rowsWritten: totalRows, errors };
+  return { sitesProcessed: sites.length, sitesLeftOut: owners.leftOut.length, productOff: owners.summary, rowsWritten: totalRows, errors };
 }
 
 // ══════════════════════════════════════════════════════════════
 // JOB 2: Backlink Watch — weekly snapshot
 // ══════════════════════════════════════════════════════════════
-export async function runBacklinkSnapshot(pool, log) {
-  const sites = await listAuthoritySites(pool);
+export async function runBacklinkSnapshot(pool, log, deps = {}) {
+  const sites = (await onlyArionOwners(await listAuthoritySites(pool), deps, log, "backlinks")).kept;
   log(`[backlinks] processing ${sites.length} Authority-tier site(s)`);
   let totalRows = 0;
   const errors = [];
@@ -511,8 +528,8 @@ async function fetchPage(url) {
   }
 }
 
-export async function runPageChangeSweep(pool, log) {
-  const sites = await listAuthoritySites(pool);
+export async function runPageChangeSweep(pool, log, deps = {}) {
+  const sites = (await onlyArionOwners(await listAuthoritySites(pool), deps, log, "page changes")).kept;
   log(`[pagechanges] processing ${sites.length} Authority-tier site(s)`);
   let totalRows = 0;
   const errors = [];

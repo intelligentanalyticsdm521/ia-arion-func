@@ -318,6 +318,54 @@ export function ownedJsonOrNull(verdict) {
 }
 
 /**
+ * For a timer that already has its rows (sites, posts, businesses): keep the
+ * rows of businesses that have `product`, leave out the rest UNTOUCHED.
+ *
+ * FEATURES rows 23-33 (audit 2026-10-11): every timer's list is filtered by the
+ * product it serves. Uses checkOwnership (so apply mode, the agency path and
+ * "unknown = runs as before" are the same everywhere).
+ *
+ *   holdWhenUndecided: false (default) — a check that could not be made keeps
+ *     every row, as before (a background pull for the business's own data).
+ *   holdWhenUndecided: true — for a SEND: when the check could not be made,
+ *     NOTHING is kept; the rows stay queued and the next tick asks again.
+ *
+ * A row with no business id is kept (nothing to ask about; never deny on
+ * "we don't know").
+ *
+ * @returns {Promise<{ kept: any[], leftOut: any[], held: boolean, verdict: object|null, summary: object|null }>}
+ */
+export async function keepRowsOfOwners(product, rows, opts = {}) {
+  const {
+    tenantOf = (r) => r?.tenant_id,
+    ownership = null,
+    did = "nothing was run for it",
+    holdWhenUndecided = false,
+    log = console,
+  } = opts;
+  const list = Array.isArray(rows) ? rows : [];
+  const ids = [...new Set(list.map(tenantOf).filter(Boolean).map(String))];
+  if (!ids.length) return { kept: list.slice(), leftOut: [], held: false, verdict: null, summary: null };
+  const ask = ownership || ((p, tenantIds) => checkOwnership(p, tenantIds, { log }));
+  const verdict = await ask(product, ids);
+  const summary = ownershipSummary(verdict, did);
+  if (verdict.undecided && holdWhenUndecided) {
+    log.warn?.("[productOwnership]",
+      `could not check which businesses have ${productName(product)}, so nothing was sent this time; it is asked again next run`);
+    return { kept: [], leftOut: list.slice(), held: true, verdict, summary };
+  }
+  const on = new Set((verdict.owned || []).map(norm));
+  const kept = [];
+  const leftOut = [];
+  for (const row of list) {
+    const id = tenantOf(row);
+    if (!id || on.has(norm(id))) kept.push(row);
+    else leftOut.push(row);
+  }
+  return { kept, leftOut, held: false, verdict, summary };
+}
+
+/**
  * What a runner's summary says about the check, in one object:
  *   { product, skipped: [{ tenantId, reason, ended, note }], undecided, error, unknown, unconfirmed }
  * `did` names what this runner did not do ("the Responder did not answer this
@@ -337,4 +385,4 @@ export function ownershipSummary(verdict, did) {
   };
 }
 
-export default { filterOwned, checkOwnership, timerStopsLive, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };
+export default { filterOwned, checkOwnership, keepRowsOfOwners, timerStopsLive, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };

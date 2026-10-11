@@ -11,6 +11,7 @@
  * in the payload JSON so the next run can retry.
  */
 import sql from "mssql";
+import { keepRowsOfOwners } from "./productOwnership.js";
 
 const REQUEST_TIMEOUT_MS = 20_000;
 
@@ -543,9 +544,13 @@ export async function snapshotSite(pool, site, log = () => {}) {
 }
 
 /**
- * Run snapshot for every site that has plugin connectivity markers.
+ * Run snapshot for every site that has plugin connectivity markers AND whose
+ * business owns ARION (FEATURES row 24, 11 Oct 2026). A business whose ARION
+ * has ended is left out and its rows are not touched; undecided runs as before.
+ *
+ * @param {object} [deps] { ownership } test seam (defaults to checkOwnership)
  */
-export async function runPluginSnapshot(pool, log = () => {}) {
+export async function runPluginSnapshot(pool, log = () => {}, deps = {}) {
   // site_token_raw is the PRIMARY credential and was missing from this SELECT —
   // see buildPluginAuthHeaders(). Without it every fetch was unauthenticated.
   //
@@ -564,8 +569,12 @@ export async function runPluginSnapshot(pool, log = () => {}) {
       AND (site_token_raw IS NOT NULL OR wp_app_password_ref IS NOT NULL)
     ORDER BY plugin_last_status_at ASC
   `);
-  const sites = sitesResult.recordset;
-  log(`found ${sites.length} site(s) with a usable plugin credential`);
+  const owners = await keepRowsOfOwners("arion", sitesResult.recordset, {
+    ownership: deps.ownership, did: "its website was not checked tonight",
+  });
+  const sites = owners.kept;
+  for (const s of owners.summary?.skipped || []) log(`business ${s.tenantId}: skipped — ${s.note}`);
+  log(`found ${sitesResult.recordset.length} site(s) with a usable plugin credential; ${owners.leftOut.length} left out (ARION not in the subscription)`);
 
   const results = [];
   for (const site of sites) {
@@ -581,6 +590,8 @@ export async function runPluginSnapshot(pool, log = () => {}) {
 
   return {
     sitesChecked: sites.length,
+    sitesLeftOut: owners.leftOut.length,
+    productOff: owners.summary,
     sitesWritten: results.filter((r) => r.written).length,
     errors: results.filter((r) => !r.written),
   };

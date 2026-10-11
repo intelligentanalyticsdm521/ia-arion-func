@@ -48,6 +48,7 @@ import {
 import { renderWeeklyDigestHtml } from "./weeklyDigestTemplate.js";
 import { getPlatformPool } from "./platformPool.js";
 import { businessDisplayName } from "./businessIdentity.js";
+import { keepRowsOfOwners, fetchEntitlements } from "./productOwnership.js";
 
 const EMAIL_PATH_DEFAULT = "/api/acs/email/send";
 const MARKETING_CATEGORY = "marketing";
@@ -183,33 +184,64 @@ export async function sendViaWebhook({ to, subject, html, text, tenantId, log, s
 }
 
 /**
+ * Is SPARK in this business's subscription, read live from the platform-api
+ * payload right before a send? 'owned' | 'not_owned' | 'undecided'.
+ */
+export function sparkStateOf(payload) {
+  const node = payload?.products?.spark || null;
+  if (!payload || !node || node.decided === false) return "undecided";
+  return node.owned === true ? "owned" : "not_owned";
+}
+
+/**
  * Main driver — runs one weekly tick.
+ *
+ * SPARK ONLY (FEATURES row 32, 11 Oct 2026): the business list is filtered by
+ * SPARK ownership (checkOwnership; held entirely when it cannot be checked,
+ * because this is a send), and each business is checked again LIVE on the
+ * platform-api payload right before its email: decided owned sends, decided not
+ * owned is skipped, undecided is held (nothing sent; next Monday asks again).
  *
  * @param servicesPool — connected mssql pool to iadm_services
  * @param log          — context.log forwarding
  * @param opts.now     — override current time (testing)
  * @param opts.mssql   — override mssql type (testing)
- * @returns summary { window, eligible, sent, skipped_empty, skipped_suppressed, skipped_no_owner, dry_run, errors[] }
+ * @param opts.ownership / getEntitlements / getPlatformPool / send — test
+ *        seams (default: the real ones)
+ * @returns summary { window, eligible, sent, skipped_empty, skipped_suppressed, skipped_no_owner, skipped_not_owned, held_undecided, dry_run, errors[] }
  */
 export async function runWeeklyDigestTick(servicesPool, log = () => {}, opts = {}) {
   const mssql = opts.mssql || mssqlDefault;
   const dryRun = process.env.LEADGEN_DIGEST_DRY_RUN === "1";
   const weekStart = priorWeekStartUtc(opts.now || new Date());
+  const getEnt = opts.getEntitlements || fetchEntitlements;
+  const send = opts.send || sendViaWebhook;
   const summary = {
     window: { from: weekStart.toISOString(), to: new Date(weekStart.getTime() + 7 * 86400000).toISOString() },
     eligible: 0, sent: 0, skipped_empty: 0, skipped_suppressed: 0, skipped_no_owner: 0,
+    skipped_not_owned: 0, held_undecided: 0, productOff: null,
     dry_run: dryRun, errors: [],
   };
 
-  const tenants = await listDigestEligibleTenants(servicesPool, weekStart, mssql);
-  summary.eligible = tenants.length;
-  if (!tenants.length) {
+  const listed = await listDigestEligibleTenants(servicesPool, weekStart, mssql);
+  summary.eligible = listed.length;
+  if (!listed.length) {
     log(`[leadgen-digest] no eligible tenants for window ${weekStart.toISOString()}`);
     return summary;
   }
 
+  // SPARK businesses only. Held entirely when ownership cannot be checked.
+  const owners = await keepRowsOfOwners("spark", listed, {
+    ownership: opts.ownership, holdWhenUndecided: true, did: "no weekly lead digest was sent",
+  });
+  summary.productOff = owners.summary;
+  if (owners.held) summary.held_undecided += owners.leftOut.length;
+  else summary.skipped_not_owned += owners.leftOut.length;
+  for (const s of owners.summary?.skipped || []) log(`[leadgen-digest] tenant=${s.tenantId} skipped — ${s.note}`);
+  const tenants = owners.kept;
+
   let platformPool = null;
-  try { platformPool = await getPlatformPool(); }
+  try { platformPool = await (opts.getPlatformPool || getPlatformPool)(); }
   catch (e) {
     log(`[leadgen-digest] platform DB unreachable: ${e.message} — owner lookups will fail and tenants will be skipped`);
   }
@@ -258,13 +290,29 @@ export async function runWeeklyDigestTick(servicesPool, log = () => {}, opts = {
       const agencyName = await agencyDisplayName();
       const rendered = renderWeeklyDigestHtml(digest, tenantName, agencyName);
 
+      // LIVE SPARK check, right before the send (the list check above may be
+      // a minute old, and a SEND never goes out on "we do not know").
+      let payload = null;
+      try { payload = await getEnt(t.tenant_id); } catch { payload = null; }
+      const spark = sparkStateOf(payload);
+      if (spark === "not_owned") {
+        summary.skipped_not_owned++;
+        log(`[leadgen-digest] tenant=${t.tenant_id} skipped — SPARK is not in this business's subscription`);
+        continue;
+      }
+      if (spark === "undecided") {
+        summary.held_undecided++;
+        console.warn(`[leadgen-digest] tenant=${t.tenant_id} held — could not confirm the SPARK subscription, so nothing was sent; next run asks again`);
+        continue;
+      }
+
       if (dryRun) {
         log(`[leadgen-digest] DRY-RUN tenant=${t.tenant_id} to=${owner.email} subject="${rendered.subject}" htmlBytes=${rendered.html.length}`);
         summary.sent++; // count as sent-equivalent for dry-run visibility
         continue;
       }
 
-      await sendViaWebhook({
+      await send({
         to: owner.email,
         subject: rendered.subject,
         html: rendered.html,

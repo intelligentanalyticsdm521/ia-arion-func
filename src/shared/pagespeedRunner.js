@@ -8,6 +8,7 @@
  */
 import sql from "mssql";
 import { getSecret } from "./secrets.js";
+import { keepRowsOfOwners } from "./productOwnership.js";
 
 const PSI_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const REQUEST_TIMEOUT_MS = 45_000;
@@ -292,17 +293,30 @@ function cadenceDaysForTier(tier) {
  * @param {object}  [opts]
  * @param {boolean} [opts.force] Ignore each site's cadence window. Used when a
  *   change to WHAT we capture needs verifying now rather than next cycle.
+ * @param {Function} [opts.ownership] test seam (defaults to checkOwnership)
+ * @param {Function} [opts.runPSI] test seam (defaults to the Google PSI call)
+ *
+ * Only sites whose business owns ARION are run (FEATURES row 25, 11 Oct
+ * 2026); a business whose ARION has ended is left out and nothing is written
+ * for it. Undecided runs as before.
  */
 export async function runMonthlyPageSpeed(pool, log, opts = {}) {
-  const out = { sitesProcessed: 0, sitesSkipped: 0, snapshotsWritten: 0, errors: [] };
+  const out = { sitesProcessed: 0, sitesSkipped: 0, sitesLeftOut: 0, snapshotsWritten: 0, errors: [], productOff: null };
+  const psi = opts.runPSI || runPSI;
 
   const sitesRes = await pool.request().query(`
     SELECT s.site_id, s.tenant_id, s.domain, s.arion_tier
     FROM arion.site s
     WHERE s.domain IS NOT NULL AND s.domain <> ''
   `);
-  const sites = sitesRes.recordset || [];
-  log(`found ${sites.length} site(s)`);
+  const owners = await keepRowsOfOwners("arion", sitesRes.recordset || [], {
+    ownership: opts.ownership, did: "no PageSpeed test was run for its website",
+  });
+  const sites = owners.kept;
+  out.sitesLeftOut = owners.leftOut.length;
+  out.productOff = owners.summary;
+  for (const s of owners.summary?.skipped || []) log(`business ${s.tenantId}: skipped — ${s.note}`);
+  log(`found ${sites.length} site(s)${owners.leftOut.length ? ` (${owners.leftOut.length} left out: ARION not in the subscription)` : ""}`);
 
   for (const site of sites) {
     const cadence = cadenceDaysForTier(site.arion_tier);
@@ -331,7 +345,7 @@ export async function runMonthlyPageSpeed(pool, log, opts = {}) {
     const url = "https://" + String(site.domain).replace(/^https?:\/\//, "").replace(/\/$/, "");
     for (const strategy of ["mobile", "desktop"]) {
       try {
-        const result = await runPSI(url, strategy);
+        const result = await psi(url, strategy);
         await persistSnapshot(pool, site.tenant_id, site.site_id, result, triggeredBy);
         out.snapshotsWritten++;
         log(`${site.domain} ${strategy} (${triggeredBy}): ${result.scores?.performance ?? "?"}`);
@@ -339,7 +353,7 @@ export async function runMonthlyPageSpeed(pool, log, opts = {}) {
         out.errors.push({ site_id: site.site_id, strategy, message: err.message });
         log(`${site.domain} ${strategy} FAILED: ${err.message}`);
       }
-      await new Promise((r) => setTimeout(r, 2500));
+      if (!opts.runPSI) await new Promise((r) => setTimeout(r, 2500));
     }
   }
 
