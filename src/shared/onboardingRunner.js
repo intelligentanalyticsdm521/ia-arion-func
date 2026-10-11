@@ -85,6 +85,7 @@
 // endpoints land the worker advances rows automatically.
 
 import sql from "mssql";
+import { keepRowsOfOwners } from "./productOwnership.js";
 
 const ARION_API_BASE = (process.env.ARION_API_BASE
   || "https://app-arion-api-prod-e6fuc9gzd8f3hqfe.centralus-01.azurewebsites.net").replace(/\/$/, "");
@@ -126,14 +127,31 @@ const USER_OAUTH_PHASES = ["pending_user_google_oauth", "pending_user_bing_oauth
 // dozens of sites are mid-flight after a multi-tenant launch.
 const MAX_ROWS_PER_TICK = Number(process.env.RUNNER_MAX_ROWS_PER_TICK || "10");
 
-export async function runOnboardingTick(pool, { log = () => {}, fetchImpl = globalThis.fetch } = {}) {
+export async function runOnboardingTick(pool, { log = () => {}, fetchImpl = globalThis.fetch, ownership = null } = {}) {
   if (process.env.ONBOARDING_RUNNER_WORKER_DISABLED === "true") {
     log("disabled via ONBOARDING_RUNNER_WORKER_DISABLED");
     return { scanned: 0, advanced: 0, failed: 0, deferred: 0, skipped: 0 };
   }
 
-  const rows = await loadStuckRows(pool);
-  const summary = { scanned: rows.length, advanced: 0, failed: 0, deferred: 0, skipped: 0 };
+  const stuck = await loadStuckRows(pool);
+  const summary = { scanned: stuck.length, advanced: 0, failed: 0, deferred: 0, skipped: 0, leftOut: 0, held: 0 };
+  if (stuck.length === 0) return summary;
+
+  // ARION ONLY (11 Oct 2026, "If they don't have the subscription you don't
+  // get any features"). Each phase starts ARION work for the website, some of
+  // it paid for by us (the plugin stack, a WordPress editor user, a billable
+  // SE Ranking project, Google and Bing set-up). A site whose business's ARION
+  // has ended is left exactly where it is: nothing advanced, nothing marked
+  // failed, so a re-subscribe carries on. When ownership cannot be checked the
+  // rows are HELD the same way (these steps spend), and the next tick asks again.
+  const owners = await keepRowsOfOwners("arion", stuck, {
+    ownership, holdWhenUndecided: true, did: "its website set-up was not advanced",
+  });
+  const rows = owners.kept;
+  if (owners.held) summary.held = owners.leftOut.length;
+  else summary.leftOut = owners.leftOut.length;
+  for (const s of owners.summary?.skipped || []) log(`business ${s.tenantId}: skipped — ${s.note}`);
+  if (owners.held) log(`could not confirm which businesses have ARION, so ${owners.leftOut.length} site(s) were held; asked again next tick`);
   if (rows.length === 0) return summary;
 
   log(`scanning ${rows.length} stuck site(s)`);
