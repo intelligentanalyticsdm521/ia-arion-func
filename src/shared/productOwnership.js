@@ -409,7 +409,8 @@ export async function keepRowsByPayload(product, rows, opts = {}) {
     if (!id || stateOf.has(k)) continue;
     let payload = null;
     try { payload = await getEntitlements(id); } catch { payload = null; }
-    stateOf.set(k, { state: payloadState(payload, key), node: payload?.products?.[key] || null });
+    // payload kept so a caller can ask the same answer about a feature key.
+    stateOf.set(k, { state: payloadState(payload, key), node: payload?.products?.[key] || null, payload });
   }
   const kept = [];
   const notOwned = [];

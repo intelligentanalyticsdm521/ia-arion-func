@@ -13,7 +13,10 @@
 // LUMEN, the database and platform-api stubbed:
 //   neither product   -> left out: nothing read, nothing paid, nothing written
 //   undecided         -> the free reads run as before; no paid X read
-//   owned             -> as before, with the tier from the same payload
+//   owned             -> as before; paid X reads only where the same payload's
+//                        features say my_brand_social_connect_x is in the plan
+//                        (allowed false -> none, with the plan named; allowed
+//                        null or a missing key -> held, a spend)
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -23,10 +26,20 @@ const fetcher = await import("../src/functions/socialAnalyticsFetcher.js");
 const OWNED = "11111111-1111-4111-8111-111111111111";
 const NONE = "22222222-2222-4222-8222-222222222222";
 const UNSURE = "33333333-3333-4333-8333-333333333333";
+const OWNED_NO_X = "44444444-4444-4444-8444-444444444444";
+const OWNED_X_UNDECIDED = "55555555-5555-4555-8555-555555555555";
+const OWNED_NO_KEY = "66666666-6666-4666-8666-666666666666";
+const X = fetcher.X_READS_FEATURE;
+const xEntry = (allowed, needs = null) => ({ allowed, reason: "test", needs, product: "my_brand", min_tier: "pro", addon: null, addon_min_tier: null, kind: "action", availability: "live" });
+const myBrand = (features) => ({ decided: true, products: { arion: { owned: true, tier: "standard", decided: true }, spark: { owned: false, decided: true }, my_brand: { owned: true, tier: "business", decided: true } }, features, sources: { catalog: "ok" } });
 const quiet = { log() {}, warn() {}, error() {} };
 
 const payloads = {
-  [OWNED]: { decided: true, products: { arion: { owned: false, decided: true }, spark: { owned: true, tier: "pro", decided: true }, my_brand: { owned: true, tier: "pro", decided: true } } },
+  [OWNED]: { decided: true, products: { arion: { owned: false, decided: true }, spark: { owned: true, tier: "pro", decided: true }, my_brand: { owned: true, tier: "pro", decided: true } }, features: { [X]: xEntry(true) }, sources: { catalog: "ok" } },
+  // The node says Business, but the catalog answer is the only thing that decides X reads.
+  [OWNED_NO_X]: myBrand({ [X]: xEntry(false, "My Brand Pro") }),
+  [OWNED_X_UNDECIDED]: myBrand({ [X]: xEntry(null) }),
+  [OWNED_NO_KEY]: myBrand({}),
   [NONE]: { decided: true, products: { arion: { owned: false, decided: true }, spark: { owned: false, decided: true }, my_brand: { owned: false, tier: null, decided: true } } },
   [UNSURE]: null, // platform-api did not answer
 };
@@ -54,10 +67,13 @@ async function runFetcher() {
       { tenant_id: OWNED, tier: "standard", connections: [] },
       { tenant_id: NONE, tier: "business", connections: [] },
       { tenant_id: UNSURE, tier: "business", connections: [] },
+      { tenant_id: OWNED_NO_X, tier: "business", connections: [] },
+      { tenant_id: OWNED_X_UNDECIDED, tier: "business", connections: [] },
+      { tenant_id: OWNED_NO_KEY, tier: "business", connections: [] },
     ],
     getPool: async () => { poolOpened++; return {}; },
     processTenant: async (_pool, tenant, _log, opts) => {
-      processed.push({ id: tenant.tenant_id, opts, xReads: fetcher.xReadsAllowed(opts, tenant.tier) });
+      processed.push({ id: tenant.tenant_id, opts, xReads: fetcher.xReadsAllowed(opts) });
       return { inserted: 1, updated: 0, upsert_errors: 0 };
     },
     getEntitlements,
@@ -69,7 +85,7 @@ test("social analytics: a business with neither ARION nor SPARK is left out (not
   const { totals, processed } = await runFetcher();
   assert.ok(!processed.some((p) => p.id === NONE));
   assert.equal(totals.leftOut, 1);
-  assert.equal(totals.tenants, 3);
+  assert.equal(totals.tenants, 6);
 });
 
 test("social analytics: undecided -> the free reads run, but no paid X read", async () => {
@@ -80,20 +96,57 @@ test("social analytics: undecided -> the free reads run, but no paid X read", as
   assert.equal(unsure.xReads, false, "no X spend on 'we do not know', even with a Business hint");
 });
 
-test("social analytics: owned -> runs as before, the tier from the subscription", async () => {
+test("social analytics: owned and X in the plan -> runs as before, with paid X reads", async () => {
   const { processed, totals } = await runFetcher();
   const owned = processed.find((p) => p.id === OWNED);
   assert.equal(owned.opts.spendAllowed, true);
-  assert.equal(owned.opts.tier, "pro", "the payload's tier, not LUMEN's 'standard' hint");
+  assert.equal(owned.opts.xPlan, "run");
   assert.equal(owned.xReads, true);
-  assert.equal(totals.inserted, 2);
+  assert.equal(totals.inserted, 5);
 });
 
-test("xReadsAllowed: confirmed only, and the tier must include X reads", () => {
-  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true, tier: "pro" }), true);
-  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true, tier: "standard" }), false);
-  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true }, "lite"), false);
-  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true }), true, "unknown tier on a confirmed business: allowed, the budget cap still applies");
-  assert.equal(fetcher.xReadsAllowed({ spendAllowed: false, tier: "business" }), false);
-  assert.equal(fetcher.xReadsAllowed({}, "business"), false);
+test("social analytics: X not in the plan -> the free reads run, no paid X read, and the plan it needs is said", async () => {
+  const lines = [];
+  const seen = [];
+  await fetcher.runSocialAnalyticsTick((m) => lines.push(m), {
+    fetchTenants: async () => [{ tenant_id: OWNED_NO_X, tier: "business", connections: [] }],
+    getPool: async () => ({}),
+    processTenant: async (_p, t, _l, opts) => { seen.push({ opts, xReads: fetcher.xReadsAllowed(opts) }); return { inserted: 0, updated: 0, upsert_errors: 0 }; },
+    getEntitlements,
+  });
+  assert.equal(seen.length, 1, "its own posts are still read");
+  assert.equal(seen[0].opts.spendAllowed, true);
+  assert.equal(seen[0].opts.xPlan, "refuse");
+  assert.equal(seen[0].opts.xNeeds, "My Brand Pro");
+  assert.equal(seen[0].xReads, false, "a Business tier on the node does not buy X reads; the catalog decides");
+  assert.ok(lines.some((l) => /needs My Brand Pro/.test(l)), lines.join(" | "));
+});
+
+test("social analytics: X undecided, or the key missing from the answer -> paid X reads are held", async () => {
+  const { processed } = await runFetcher();
+  for (const id of [OWNED_X_UNDECIDED, OWNED_NO_KEY]) {
+    const p = processed.find((x) => x.id === id);
+    assert.ok(p, "its own posts are still read");
+    assert.equal(p.opts.spendAllowed, true);
+    assert.equal(p.opts.xPlan, "hold");
+    assert.equal(p.xReads, false);
+  }
+});
+
+test("xReadsAllowed: My Brand confirmed AND the catalog says X is in the plan", () => {
+  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true, xPlan: "run" }), true);
+  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true, xPlan: "refuse" }), false);
+  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true, xPlan: "hold" }), false);
+  assert.equal(fetcher.xReadsAllowed({ spendAllowed: true }), false, "no catalog answer is no spend");
+  assert.equal(fetcher.xReadsAllowed({ spendAllowed: false, xPlan: "run" }), false);
+  assert.equal(fetcher.xReadsPlan(null).action, "hold");
+  assert.equal(fetcher.xReadsPlan({ features: { [X]: xEntry(true) }, sources: { catalog: "unreadable" } }).action, "hold", "an unreadable catalog is undecided");
+  assert.equal(fetcher.xReadsPlan(myBrand({ [X]: xEntry(true) })).action, "run");
+});
+
+test("no tier list for X reads is left in the fetcher (replace means delete)", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("../src/functions/socialAnalyticsFetcher.js", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /X_READ_TIERS/);
+  assert.doesNotMatch(src, /new Set\(\[\s*"pro"/, "no set of tier words decides X reads");
 });

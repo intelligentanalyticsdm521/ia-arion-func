@@ -14,8 +14,8 @@
 // Flow (all inside one timer invocation):
 //   1.  GET LUMEN-API /my-brand/social/_internal/tenants-with-connections
 //       → list of every tenant that has at least one ACTIVE connection,
-//         flattened with the platforms + connection rows it owns. Includes a
-//         best-effort `tier` hint used to gate paid surfaces (X reads).
+//         flattened with the platforms + connection rows it owns. Paid X
+//         reads follow the feature catalog (X_READS_FEATURE), not a tier.
 //   2.  For each tenant:
 //        a) Pull every published social_post_target from the last 90 days
 //           that hasn't been refetched in the last 23h (via direct read of
@@ -53,6 +53,7 @@ import { app } from "@azure/functions";
 import { getServicesPool } from "../shared/servicesPool.js";
 import { getSecret } from "../shared/secrets.js";
 import { keepRowsByPayload } from "../shared/productOwnership.js";
+import { featureGate, featuresOf } from "../shared/featureGate.js";
 import mssql from "mssql";
 
 const SCHEDULE = "0 43 5 * * *";
@@ -62,7 +63,12 @@ const LOOKBACK_DAYS = 90;
 const REFETCH_MIN_AGE_HOURS = 23;
 const X_MONTHLY_CAP_USD = 20;
 const X_READ_SURFACE = "my_brand.x_analytics_read";
-const X_READ_TIERS = new Set(["pro", "authority", "business", "enterprise"]); // tiers that include X reads
+/**
+ * The catalog feature paid X reads belong to (platform-api core.features):
+ * the X account connection. Which My Brand plan includes it lives only in the
+ * catalog (11 Oct 2026, "one list").
+ */
+export const X_READS_FEATURE = "my_brand_social_connect_x";
 const UPSERT_CHUNK = 500;
 const HTTP_TIMEOUT_MS = 15_000;
 
@@ -516,23 +522,24 @@ async function fetchLinkedInAccountMetrics(conn, token) {
 /**
  * May this run make paid X reads for a business?
  * X reads are a paid spend: only for a business whose My Brand is CONFIRMED
- * (opts.spendAllowed true). We could not confirm -> no X reads this run; the
- * free reads still run. The tier comes from the subscription (platform-api's
- * my_brand node, opts.tier) when it carries one; LUMEN's best-effort hint is
- * the fallback. An unknown tier on a confirmed business is allowed (the
- * monthly budget cap still applies), as before.
+ * (opts.spendAllowed true) AND whose plan includes X_READS_FEATURE by the
+ * feature catalog (opts.xPlan, featureGate's action for the intent 'spend').
+ * Not in the plan, undecided, an unreadable catalog or a missing key -> no X
+ * reads this run; the free reads still run. The monthly budget cap still
+ * applies on top.
  */
-export function xReadsAllowed(opts = {}, hintTier = null) {
-  if (opts.spendAllowed !== true) return false;
-  const tier = String(opts.tier || hintTier || "").toLowerCase();
-  return !tier || X_READ_TIERS.has(tier);
+export function xReadsAllowed(opts = {}) {
+  return opts.spendAllowed === true && opts.xPlan === "run";
+}
+
+/** featureGate's answer for paid X reads, from one platform-api payload. */
+export function xReadsPlan(payload) {
+  return featureGate(featuresOf(payload), X_READS_FEATURE, "spend");
 }
 
 async function processTenant(pool, tenant, log, opts = {}) {
   const tenantId = tenant.tenant_id;
-  // The tier comes from the subscription (platform-api's my_brand node) when it
-  // carries one; LUMEN's best-effort hint is the fallback.
-  const xAllowedByTier = xReadsAllowed(opts, tenant.tier);
+  const xAllowedByPlan = xReadsAllowed(opts);
   if (opts.spendAllowed === false) log(`tenant=${tenantId} X reads held — could not confirm this business's subscription just now`);
 
   // Pre-check the X budget so we can skip the X work cheaply.
@@ -573,7 +580,7 @@ async function processTenant(pool, tenant, log, opts = {}) {
       } else if (t.platform === "instagram") {
         m = await fetchInstagramPostMetrics(t, token);
       } else if (t.platform === "x") {
-        if (!xAllowedByTier) continue;          // tier doesn't include paid X reads
+        if (!xAllowedByPlan) continue;          // the plan does not include paid X reads
         if (xOverBudget) continue;              // cap hit
         // Pre-emptive cap check: don't exceed budget mid-loop.
         const projected = xSpend + (xCallsThisRun + 1) * X_READ_COST_PER_CALL_USD;
@@ -652,7 +659,7 @@ async function processTenant(pool, tenant, log, opts = {}) {
       } else if (conn.platform === "instagram") {
         a = await fetchInstagramAccountMetrics(conn, token);
       } else if (conn.platform === "x") {
-        if (!xAllowedByTier || xOverBudget) continue;
+        if (!xAllowedByPlan || xOverBudget) continue;
         const projected = xSpend + (xCallsThisRun + 1) * X_READ_COST_PER_CALL_USD;
         if (projected >= X_MONTHLY_CAP_USD) continue;
         a = await fetchXAccountMetrics(conn, token);
@@ -717,7 +724,8 @@ async function processTenant(pool, tenant, log, opts = {}) {
  *   undecided         -> the free reads of the business's own posts run as
  *                        before, but no paid X read (a spend is never made on
  *                        "we do not know");
- *   owned             -> as before, with the tier from the same payload.
+ *   owned             -> as before; paid X reads only where the same payload's
+ *                        features say X_READS_FEATURE is in the plan.
  *
  * @param deps { fetchTenants, getPool, processTenant, getEntitlements } test seams
  */
@@ -747,9 +755,16 @@ export async function runSocialAnalyticsTick(log, deps = {}) {
     for (const tenant of owners.kept) {
       const answer = owners.stateOf.get(String(tenant.tenant_id || "").trim().toUpperCase());
       try {
+        const xPlan = xReadsPlan(answer?.payload);
+        if (answer?.state === "owned" && xPlan.action !== "run") {
+          log(xPlan.action === "refuse"
+            ? `tenant=${tenant.tenant_id} no paid X reads — X is not in this business's plan${xPlan.needs ? ` (needs ${xPlan.needs})` : ""}`
+            : `tenant=${tenant.tenant_id} no paid X reads — could not confirm X is in this business's plan (${xPlan.reason})`);
+        }
         const r = await runTenant(pool, tenant, log, {
           spendAllowed: answer?.state === "owned",
-          tier: answer?.node?.tier || null,
+          xPlan: xPlan.action,
+          xNeeds: xPlan.needs || null,
         });
         totals.inserted += r.inserted;
         totals.updated += r.updated;

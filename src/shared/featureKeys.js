@@ -16,11 +16,12 @@
 // scripts/_check-feature-keys.mjs diffs that copy against the seed.
 import { MARKET_MONITOR_FEATURE } from "./marketMonitor.js";
 import { VOICE_MONITOR_FEATURE } from "./pageVoiceScore.js";
+import { X_READS_FEATURE } from "../functions/socialAnalyticsFetcher.js";
 import { platformApiUrl, platformInternalToken } from "./platformEnv.js";
 
 /** Every catalog key arion-func gates on (sorted, unique). */
 export function namedFeatureKeys() {
-  return [...new Set([MARKET_MONITOR_FEATURE, VOICE_MONITOR_FEATURE])].sort();
+  return [...new Set([MARKET_MONITOR_FEATURE, VOICE_MONITOR_FEATURE, X_READS_FEATURE])].sort();
 }
 
 /**

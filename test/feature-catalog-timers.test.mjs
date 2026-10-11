@@ -217,7 +217,7 @@ test("every key the timers gate on is in this repo's copy of the catalog keys", 
   const j = JSON.parse(fs.readFileSync(path.join(ROOT, "test", "fixtures", "feature-keys.json"), "utf8"));
   assert.equal(j.count, j.keys.length);
   const have = new Set(j.keys);
-  assert.deepEqual(namedFeatureKeys(), ["arion_seo_market_monitor", "my_brand_voice_monitor"]);
+  assert.deepEqual(namedFeatureKeys(), ["arion_seo_market_monitor", "my_brand_social_connect_x", "my_brand_voice_monitor"]);
   for (const k of namedFeatureKeys()) assert.ok(have.has(k), k);
 });
 
@@ -240,7 +240,7 @@ test("startup check: logs every named key the catalog lacks; quiet when all pres
   const r = await checkFeatureKeysAtStartup({ env, log, fetchImpl: async (url, o) => { asked = { url, tok: o.headers["x-internal-token"] }; return jsonRes({ features: [{ key: "arion_seo_market_monitor" }] }); } });
   assert.match(asked.url, /\/internal\/feature-catalog$/);
   assert.equal(asked.tok, "t");
-  assert.deepEqual(r.missing, ["my_brand_voice_monitor"]);
+  assert.deepEqual(r.missing, ["my_brand_social_connect_x", "my_brand_voice_monitor"]);
   assert.equal(errors.length, 1);
   const ok = await checkFeatureKeysAtStartup({ env, log, fetchImpl: async () => jsonRes({ features: namedFeatureKeys().map((key) => ({ key })) }) });
   assert.deepEqual(ok.missing, []);
