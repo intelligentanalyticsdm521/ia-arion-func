@@ -52,6 +52,7 @@
 import { app } from "@azure/functions";
 import { getServicesPool } from "../shared/servicesPool.js";
 import { getSecret } from "../shared/secrets.js";
+import { keepRowsByPayload } from "../shared/productOwnership.js";
 import mssql from "mssql";
 
 const SCHEDULE = "0 43 5 * * *";
@@ -512,10 +513,27 @@ async function fetchLinkedInAccountMetrics(conn, token) {
 
 // ── per-tenant orchestration ──────────────────────────────────────────────
 
-async function processTenant(pool, tenant, log) {
+/**
+ * May this run make paid X reads for a business?
+ * X reads are a paid spend: only for a business whose My Brand is CONFIRMED
+ * (opts.spendAllowed true). We could not confirm -> no X reads this run; the
+ * free reads still run. The tier comes from the subscription (platform-api's
+ * my_brand node, opts.tier) when it carries one; LUMEN's best-effort hint is
+ * the fallback. An unknown tier on a confirmed business is allowed (the
+ * monthly budget cap still applies), as before.
+ */
+export function xReadsAllowed(opts = {}, hintTier = null) {
+  if (opts.spendAllowed !== true) return false;
+  const tier = String(opts.tier || hintTier || "").toLowerCase();
+  return !tier || X_READ_TIERS.has(tier);
+}
+
+async function processTenant(pool, tenant, log, opts = {}) {
   const tenantId = tenant.tenant_id;
-  const tier = (tenant.tier || "").toLowerCase();
-  const xAllowedByTier = !tier || X_READ_TIERS.has(tier); // unknown tier → allow (fail open), budget cap still applies
+  // The tier comes from the subscription (platform-api's my_brand node) when it
+  // carries one; LUMEN's best-effort hint is the fallback.
+  const xAllowedByTier = xReadsAllowed(opts, tenant.tier);
+  if (opts.spendAllowed === false) log(`tenant=${tenantId} X reads held — could not confirm this business's subscription just now`);
 
   // Pre-check the X budget so we can skip the X work cheaply.
   const xSpend = await sumMonthlyXReadCost(pool, tenantId, log);
@@ -686,6 +704,70 @@ async function processTenant(pool, tenant, log) {
   };
 }
 
+// ── one run ───────────────────────────────────────────────────────────────
+
+/**
+ * One run of the fetcher.
+ *
+ * MY BRAND ONLY (11 Oct 2026, "They only get the features for subscriptions
+ * they are signed up for"). Social analytics are My Brand, and platform-api
+ * answers products.my_brand as owned when the business owns ARION OR SPARK.
+ *   decided not owned -> left out: no platform read, no paid X read, nothing
+ *                        written;
+ *   undecided         -> the free reads of the business's own posts run as
+ *                        before, but no paid X read (a spend is never made on
+ *                        "we do not know");
+ *   owned             -> as before, with the tier from the same payload.
+ *
+ * @param deps { fetchTenants, getPool, processTenant, getEntitlements } test seams
+ */
+export async function runSocialAnalyticsTick(log, deps = {}) {
+  const fetchTenants = deps.fetchTenants || fetchTenantsWithConnections;
+  const getPool = deps.getPool || getServicesPool;
+  const runTenant = deps.processTenant || processTenant;
+  const totals = { tenants: 0, leftOut: 0, inserted: 0, updated: 0, upsertErrors: 0, errors: 0 };
+
+  try {
+    const listed = await fetchTenants(log);
+    totals.tenants = listed.length;
+    if (!listed.length) {
+      log("no tenants with active connections — done");
+      return totals;
+    }
+
+    const owners = await keepRowsByPayload("my_brand", listed, { getEntitlements: deps.getEntitlements });
+    totals.leftOut = owners.notOwned.length;
+    for (const t of owners.notOwned) {
+      log(`tenant=${t.tenant_id} skipped — neither ARION nor SPARK is in this business's subscription, so its social analytics were not fetched`);
+    }
+    if (!owners.kept.length) return totals;
+
+    const pool = await getPool();
+
+    for (const tenant of owners.kept) {
+      const answer = owners.stateOf.get(String(tenant.tenant_id || "").trim().toUpperCase());
+      try {
+        const r = await runTenant(pool, tenant, log, {
+          spendAllowed: answer?.state === "owned",
+          tier: answer?.node?.tier || null,
+        });
+        totals.inserted += r.inserted;
+        totals.updated += r.updated;
+        totals.upsertErrors += r.upsert_errors;
+      } catch (e) {
+        totals.errors++;
+        log(`tenant=${tenant.tenant_id} FAILED: ${e?.message?.slice(0, 300)}`);
+      }
+    }
+  } catch (e) {
+    log(`FATAL: ${e?.message?.slice(0, 300)}`);
+    totals.errors++;
+  }
+  return totals;
+}
+
+export { processTenant };
+
 // ── timer registration ────────────────────────────────────────────────────
 
 app.timer("socialAnalyticsFetcher", {
@@ -697,33 +779,7 @@ app.timer("socialAnalyticsFetcher", {
     if (timer?.isPastDue) log("isPastDue=true");
 
     const startedAt = Date.now();
-    let totals = { tenants: 0, inserted: 0, updated: 0, upsertErrors: 0, errors: 0 };
-
-    try {
-      const tenants = await fetchTenantsWithConnections(log);
-      totals.tenants = tenants.length;
-      if (!tenants.length) {
-        log("no tenants with active connections — done");
-        return;
-      }
-
-      const pool = await getServicesPool();
-
-      for (const tenant of tenants) {
-        try {
-          const r = await processTenant(pool, tenant, log);
-          totals.inserted += r.inserted;
-          totals.updated += r.updated;
-          totals.upsertErrors += r.upsert_errors;
-        } catch (e) {
-          totals.errors++;
-          log(`tenant=${tenant.tenant_id} FAILED: ${e?.message?.slice(0, 300)}`);
-        }
-      }
-    } catch (e) {
-      log(`FATAL: ${e?.message?.slice(0, 300)}`);
-      totals.errors++;
-    }
+    const totals = await runSocialAnalyticsTick(log);
 
     const elapsedMs = Date.now() - startedAt;
     log(
