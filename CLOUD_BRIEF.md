@@ -1,0 +1,16 @@
+# Cloud brief: SEO without SE Ranking, run 1, arion-func (the crawler)
+
+You are a Claude Code cloud session on the arion-func repository (Azure Functions, Node; branch `cloud/seo-run-1`, cut from `release/sept-a-2026` on 11 Oct 2026). Read, in this order: `docs/cloud/SCOPE_SEO_TOOLS_WITHOUT_SERANKING_2026-10-09.md` (the decision block at the top, then sections 3 "Website audit", 5.4, 6, 7), `docs/cloud/SUBSCRIPTION_IS_THE_PERMISSION_2026-10-11.md`. Then read the code: `src/index.js` (how timers register), `src/shared/productOwnership.js` (keepRowsOfOwners, holdWhenUndecided), `src/functions/pluginSnapshot.js` and `src/shared/pluginSnapshot.js` (a sitemap-driven runner that exists), the crawler that exists in this repo or in arion-api (the scope names it in section 3; search for it), and `test/` for the house style (node --test, stubbed SQL and fetch).
+
+## What to build here (arion-func only)
+1. **Our crawler**, sitemap-driven, polite (per-host rate, robots honoured, a cap lifted from today's), keeping every status (non-2xx kept), recording redirect chains, canonical chains, noindex from meta and headers, inlinks, broken links in and out, sizes, timings, duplicates and thin pages. It runs per site on a timer by the SEO add-on cadence (Starter and Essentials every 30 days, Growth every 14, Authority every 7; `arion.site.seo_addon_tier`), only for sites of businesses that own ARION (the existing ownership helper, hold when undecided), and on demand when arion-api's recheck endpoint rings it.
+2. **Issue categories and severities** exactly as the Site Audit page shows them today (read the Portal's page copy in `docs/cloud/SITE_AUDIT_PAGE_FIELDS.md` if present, else the arion-api Site Audit route's response shape in its tests), written to `arion.seo_audit_run` and `arion.seo_audit_issue` (the table contract: run_id, site_id, started_at, finished_at, pages_crawled, score, status; issue: run_id, url, category, severity, detail_json). The migrations are written by the arion-api cloud session; here, write to those columns and stub the pool in tests.
+3. **Our score**: a published formula (documented in `docs/SEO_AUDIT_SCORE.md` in this repo), labelled ours, never a vendor's.
+4. **PSI per key page** recorded on the run (home, services, contact, the top ten by inlinks).
+5. **Tests**: the crawler against a stubbed site (fixtures with redirects, canonicals, noindex headers, broken links, thin pages, a robots.txt that forbids a path, a slow host); the score formula; the ownership hold; one mutation per guard. `npm test` at the end, reported honestly.
+
+## Rules
+- Never hammer a host: at most one request in flight per host, a delay between requests, a user agent that names the platform generically (never Intelligent Analytics), and robots.txt honoured.
+- American spelling; plain words; nothing hardcoded for Intelligent Analytics.
+- Commit on this branch with plain-English titles; end every commit message with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`. Push this branch to origin (GitHub mirror) when done. Never touch production or a live website; in tests nothing may reach the network.
+- Final report, in the last message: commits, what is done, what is not done and why, the suite result, and the table contract you wrote to.
