@@ -196,7 +196,7 @@ test("Market Monitor: moves, backlinks and page changes leave an ended ARION's s
       return null;
     });
     await withFetch(() => null, async (urls) => {
-      const r = await run(pool, () => {}, { ownership: ownershipOver(offPlatform()) });
+      const r = await run(pool, () => {}, { ownership: ownershipOver(offPlatform()), getEntitlements: arionPayload(true) });
       assert.equal(r.sitesProcessed, 1, run.name);
       assert.equal(named(pool, SITE_OFF), false, `${run.name}: nothing written for the ended site`);
       assert.ok(named(pool, SITE_ON), `${run.name}: the owned site runs as before`);
@@ -219,7 +219,17 @@ function voiceFetch(spent) {
     return null;
   };
 }
-const arionPayload = (owned, decided = true) => async () => ({ decided, products: { arion: { owned, tier: "pro", decided } } });
+// platform-api's payload, with the feature catalog's answer for the two keys
+// the timers gate on (11 Oct 2026): owned -> allowed, ended -> not, undecided -> null.
+const featureAnswer = (owned, decided) => (decided ? owned === true : null);
+const arionPayload = (owned, decided = true) => async () => ({
+  decided, products: { arion: { owned, tier: "pro", decided } },
+  features: {
+    my_brand_voice_monitor: { allowed: featureAnswer(owned, decided), reason: "x", needs: "ARION Pro", product: "my_brand", min_tier: "pro", addon: null, addon_min_tier: null, kind: "action", availability: "live" },
+    arion_seo_market_monitor: { allowed: featureAnswer(owned, decided), reason: "x", needs: "the ARION SEO add-on (Authority)", product: "arion", min_tier: null, addon: "seo", addon_min_tier: "authority", kind: "page", availability: "live" },
+  },
+  sources: { catalog: "ok" },
+});
 
 test("voice score: an ended ARION is left out and no model call is made for it; the owned one is scored", async () => {
   const pool = fakePool((s) => (/FROM arion\.site/.test(s) && /wp_app_password_ref IS NOT NULL/.test(s) ? { recordset: twoSites() } : null));

@@ -15,8 +15,11 @@
  *      and logs diffs into arion.site_page_change.
  *
  * Each job:
- *   - Only touches sites where seo_addon_tier = 'authority' (Market Monitor
- *     is Authority-gated).
+ *   - Only touches sites whose business's plan includes Market Monitor
+ *     (feature catalog key MARKET_MONITOR_FEATURE, arion_seo_market_monitor)
+ *     AND whose own SEO add-on rung (arion.site.seo_addon_tier) reaches the
+ *     rung the catalog row names (addon_min_tier; Authority today). The rung
+ *     is no longer written in this file (11 Oct 2026, "one list").
  *   - Writes a market_monitor_job_log row before + after so the API can
  *     show "last successful run".
  *   - Returns { sitesProcessed, rowsWritten, errors[] }.
@@ -25,18 +28,22 @@ import sql from "mssql";
 import crypto from "node:crypto";
 import { projectApi, dataApi } from "./seranking.js";
 import { keepRowsOfOwners } from "./productOwnership.js";
+import { keepRowsWithFeature, rungMeets } from "./featureGate.js";
 
-const AUTHORITY_TIER = "authority";
+/** The catalog feature these jobs do work for (platform-api core.features). */
+export const MARKET_MONITOR_FEATURE = "arion_seo_market_monitor";
 
 // ──────────────────────────────────────────────────────────────
 // Shared helpers
 // ──────────────────────────────────────────────────────────────
-async function listAuthoritySites(pool) {
+// Every site with an SE Ranking project and ANY SEO add-on rung. Which rung
+// Market Monitor needs is the catalog's (marketMonitorSites below).
+async function listAddonSites(pool) {
   const r = await pool.request().query(`
     SELECT site_id, tenant_id, domain, se_ranking_project_id, seo_addon_tier
     FROM arion.site
     WHERE se_ranking_project_id IS NOT NULL
-      AND LOWER(seo_addon_tier) = '${AUTHORITY_TIER}'
+      AND seo_addon_tier IS NOT NULL AND LTRIM(RTRIM(seo_addon_tier)) <> ''
   `);
   return r.recordset;
 }
@@ -47,7 +54,7 @@ async function listAuthoritySites(pool) {
 // backfill seeded 12 months of history that this keeps current). This
 // supersedes the 2026-07-16 "clients not syncing is by design" note below:
 // that was true when position history only served Market Monitor. Competitor
-// capture remains Authority-gated (MM tier gating is Brandon's open decision).
+// capture stays a Market Monitor feature (the catalog row decides its rung).
 async function listInsightsSites(pool) {
   const r = await pool.request().query(`
     SELECT site_id, tenant_id, domain, se_ranking_project_id, seo_addon_tier
@@ -57,14 +64,29 @@ async function listInsightsSites(pool) {
   return r.recordset;
 }
 
-const isAuthority = (site) => String(site.seo_addon_tier || "").toLowerCase() === AUTHORITY_TIER;
+/**
+ * The sites Market Monitor may work on: the business's plan includes
+ * MARKET_MONITOR_FEATURE (a background job: undecided HOLDS, asked again next
+ * run) and the site's own rung reaches the catalog row's addon_min_tier.
+ */
+async function marketMonitorSites(sites, deps, log, job) {
+  const out = await keepRowsWithFeature(MARKET_MONITOR_FEATURE, sites, {
+    intent: "job",
+    getEntitlements: deps.getEntitlements,
+    siteOk: (site, entry) => (entry && entry.addon === "seo" ? rungMeets(site.seo_addon_tier, entry.addon_min_tier) : true),
+    log: { error: (m) => log(m), warn: (m) => log(m) },
+  });
+  for (const r of out.refused) log(`[${job}] business ${r.tenantId}: Market Monitor not in its plan (${r.reason}${r.needs ? `; needs ${r.needs}` : ""})`);
+  for (const h of out.held) log(`[${job}] business ${h.tenantId}: held, ${h.reason}; asked again next run`);
+  return out;
+}
 
 // FEATURES row 27 (11 Oct 2026): every Market Monitor job runs only for
 // businesses that own ARION (the SEO add-on lives under ARION). A business
 // whose ARION has ended is left out and none of its rows are touched, so a
 // re-subscribe picks up where it stopped. Undecided runs as before.
-// NOT YET: the add-on tier itself is still the cached arion.site.seo_addon_tier
-// column, because platform-api's entitlement payload carries no SEO add-on node.
+// The rung a site HAS is still arion.site.seo_addon_tier (bought per site);
+// the rung Market Monitor NEEDS is the catalog row's (marketMonitorSites).
 async function onlyArionOwners(sites, deps, log, job) {
   const owners = await keepRowsOfOwners("arion", sites, {
     ownership: deps.ownership, did: `no Market Monitor ${job} were captured`,
@@ -212,7 +234,7 @@ export async function runMovesCapture(pool, log, deps = {}) {
   try {
     // 2026-07-25 — was listAuthoritySites. Own-site positions now capture for
     // EVERY project site (IA Insights needs the kw_* series for all clients);
-    // competitor capture below stays Authority-gated per tier.
+    // competitor capture below stays a Market Monitor feature (catalog key).
     sites = await listInsightsSites(pool);
   } catch (e) {
     e.message = `listInsightsSites failed (before any job_log row could be written): ${e.message}`;
@@ -221,7 +243,9 @@ export async function runMovesCapture(pool, log, deps = {}) {
   const owners = await onlyArionOwners(sites, deps, log, "moves");
   sites = owners.kept;
 
-  log(`[moves] processing ${sites.length} project site(s) (${sites.filter(isAuthority).length} Authority-tier)`);
+  const monitored = new Set((await marketMonitorSites(sites, deps, log, "moves")).kept.map((s) => s.site_id));
+  const isMonitored = (site) => monitored.has(site.site_id);
+  log(`[moves] processing ${sites.length} project site(s) (${monitored.size} with Market Monitor)`);
 
   if (sites.length === 0) {
     log(`[moves] no sites with an se_ranking_project_id — nothing to capture (normal, not an outage)`);
@@ -288,14 +312,15 @@ export async function runMovesCapture(pool, log, deps = {}) {
       // returns 400 in the current v4 API. Fixed 2026-04-19 after reading the
       // Project API docs.
       //
-      // 2026-07-25 — competitor capture is a Market Monitor (Authority-tier)
-      // feature; own-site capture above runs for every project site.
-      const compListRaw = isAuthority(site)
+      // 2026-07-25 — competitor capture is a Market Monitor feature (the
+      // catalog's MARKET_MONITOR_FEATURE); own-site capture above runs for
+      // every project site.
+      const compListRaw = isMonitored(site)
         ? await projectApi("GET", `/competitors/site/${encodeURIComponent(projectId)}`)
         : { ok: true, data: [] };
       const competitors = compListRaw.ok && Array.isArray(compListRaw.data) ? compListRaw.data : [];
 
-      if (competitors.length === 0 && isAuthority(site)) {
+      if (competitors.length === 0 && isMonitored(site)) {
         log(`[moves] ${site.domain}: no competitors tracked in SE Ranking project (or /competitors/site returned empty).`);
       }
 
@@ -381,8 +406,9 @@ export async function runMovesCapture(pool, log, deps = {}) {
 // JOB 2: Backlink Watch — weekly snapshot
 // ══════════════════════════════════════════════════════════════
 export async function runBacklinkSnapshot(pool, log, deps = {}) {
-  const sites = (await onlyArionOwners(await listAuthoritySites(pool), deps, log, "backlinks")).kept;
-  log(`[backlinks] processing ${sites.length} Authority-tier site(s)`);
+  const owned = (await onlyArionOwners(await listAddonSites(pool), deps, log, "backlinks")).kept;
+  const sites = (await marketMonitorSites(owned, deps, log, "backlinks")).kept;
+  log(`[backlinks] processing ${sites.length} Market Monitor site(s)`);
   let totalRows = 0;
   const errors = [];
 
@@ -529,8 +555,9 @@ async function fetchPage(url) {
 }
 
 export async function runPageChangeSweep(pool, log, deps = {}) {
-  const sites = (await onlyArionOwners(await listAuthoritySites(pool), deps, log, "page changes")).kept;
-  log(`[pagechanges] processing ${sites.length} Authority-tier site(s)`);
+  const owned = (await onlyArionOwners(await listAddonSites(pool), deps, log, "page changes")).kept;
+  const sites = (await marketMonitorSites(owned, deps, log, "page changes")).kept;
+  log(`[pagechanges] processing ${sites.length} Market Monitor site(s)`);
   let totalRows = 0;
   const errors = [];
 

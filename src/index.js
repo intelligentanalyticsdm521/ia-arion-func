@@ -3,7 +3,7 @@ import "./functions/health.js";
 import "./functions/reconcileArtifacts.js";
 import "./functions/markStaleHealth.js";
 import "./functions/manualReconcile.js";
-// Market Monitor timers — Authority-tier data capture
+// Market Monitor timers — data capture for sites whose plan includes Market Monitor
 import "./functions/marketMonitorMoves.js";
 import "./functions/marketMonitorBacklinks.js";
 import "./functions/marketMonitorPageChanges.js";
@@ -59,3 +59,7 @@ import "./functions/sparkCampaignAgentWeekly.js";
 // Kill switch BOOKING_BUTTON_SYNC_DISABLED.
 import "./functions/bookingButtonSync.js";
 import "./functions/subscriptionConfigSync.js";
+// The feature catalog (11 Oct 2026): once, when the host loads, check that
+// every feature key the timers gate on is in the catalog (logs the missing).
+import { checkFeatureKeysAtStartup } from "./shared/featureKeys.js";
+checkFeatureKeysAtStartup().catch((e) => console.warn("[featureKeys] startup check failed:", e.message));

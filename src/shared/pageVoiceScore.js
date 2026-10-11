@@ -34,6 +34,10 @@ import sql from "mssql";
 import crypto from "node:crypto";
 import { keepRowsOfOwners, fetchEntitlements } from "./productOwnership.js";
 import { maySpend } from "./entitlementsRule.js";
+import { featureGate, featuresOf } from "./featureGate.js";
+
+/** The catalog feature this scan is (platform-api core.features, My Brand Voice Monitor). */
+export const VOICE_MONITOR_FEATURE = "my_brand_voice_monitor";
 
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_PAGES_PER_SITE = 25;
@@ -284,7 +288,10 @@ export async function scanSite(pool, site, log = () => {}) {
  * model call through LUMEN, so before ANY call the business's ARION node on
  * the platform-api payload must pass maySpend: decided and owned. Undecided
  * refuses the spend (nothing is scored, nothing is written; the next run asks
- * again). A business whose ARION has ended is left out untouched.
+ * again). A business whose ARION has ended is left out untouched. The plan
+ * must also include VOICE_MONITOR_FEATURE (payload.features, the feature
+ * catalog): decided not in the plan leaves the business out with the plan it
+ * needs; undecided, unreadable or a missing key holds the spend.
  *
  * @param {object} [deps] { ownership, getEntitlements } test seams
  */
@@ -321,12 +328,21 @@ export async function runPageVoiceScoreScan(pool, log = () => {}, deps = {}) {
       let payload = null;
       try { payload = await getEnt(site.tenant_id); } catch { payload = null; }
       const node = payload?.products?.arion || null;
-      const ok = maySpend(node);
+      // The feature catalog (11 Oct 2026): scoring pages against the brand
+      // voice is VOICE_MONITOR_FEATURE; which plan includes it is the
+      // catalog's. A model spend: undecided, unreadable or missing HOLDS.
+      const features = featuresOf(payload);
+      const plan = features ? featureGate(features, VOICE_MONITOR_FEATURE, "spend") : { action: "hold", reason: "the feature list could not be read", needs: null };
+      const ok = maySpend(node) && plan.action === "run";
       spendOk.set(key, ok);
       if (!ok) {
         const why = !node || node.decided === false
           ? "we could not confirm the ARION subscription, so no model call was made"
-          : "ARION is not in this business's subscription";
+          : node.owned !== true
+            ? "ARION is not in this business's subscription"
+            : plan.action === "refuse"
+              ? `Voice Monitor is not in this business's plan${plan.needs ? ` (needs ${plan.needs})` : ""}, so no model call was made`
+              : `we could not confirm Voice Monitor is in this business's plan (${plan.reason}), so no model call was made`;
         spendRefused.push({ tenantId: site.tenant_id, reason: why });
         log(`business ${site.tenant_id}: pages not scored — ${why}`);
       }
