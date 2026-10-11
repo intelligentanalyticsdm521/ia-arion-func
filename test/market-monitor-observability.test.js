@@ -86,7 +86,9 @@ test("listAuthoritySites failing THROWS with an attributed message (was: silent 
       // "Timeout: Request failed to complete in 15000ms" out of an unprotected
       // await, with no job_log row and no attribution — indistinguishable from
       // any other failure in the run.
-      assert.match(err.message, /listAuthoritySites failed/, "error is not attributed to its stage");
+      // The stage was renamed listInsightsSites on 2026-07-25 (8dbafb1: own-site
+      // positions now capture for every project site).
+      assert.match(err.message, /listInsightsSites failed/, "error is not attributed to its stage");
       assert.match(err.message, /before any job_log row/, "does not explain why nothing was recorded");
       return true;
     }

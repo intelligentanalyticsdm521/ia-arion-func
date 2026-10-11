@@ -224,7 +224,7 @@ export async function runMovesCapture(pool, log, deps = {}) {
   log(`[moves] processing ${sites.length} project site(s) (${sites.filter(isAuthority).length} Authority-tier)`);
 
   if (sites.length === 0) {
-    log(`[moves] no sites with an se_ranking_project_id — nothing to capture`);
+    log(`[moves] no sites with an se_ranking_project_id — nothing to capture (normal, not an outage)`);
   }
 
   let totalRows = 0;
