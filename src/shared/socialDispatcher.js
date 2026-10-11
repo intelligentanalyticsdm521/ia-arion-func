@@ -42,7 +42,7 @@
 
 import { getSecret } from "./secrets.js";
 import { publishers } from "./socialPublishers.js";
-import { keepRowsOfOwners } from "./productOwnership.js";
+import { keepRowsByPayload } from "./productOwnership.js";
 
 const LUMEN_API_BASE_URL = (process.env.LUMEN_API_BASE_URL || "").replace(/\/+$/, "");
 const DISPATCH_TOKEN_ENV = "LUMEN_SOCIAL_DISPATCH_TOKEN";
@@ -81,15 +81,19 @@ function pickPlatformBody(post, platform) {
  * never breaks the tick.
  *
  * @param log — `(msg) => void` for context.log forwarding
- * @param deps — { ownership, fetchImpl, getSecret, publishers } test seams
+ * @param deps — { getEntitlements, fetchImpl, getSecret, publishers } test seams
  * @returns   — { scanned, claimed, published, partial_failure, failed, left_out, errors[] }
  *
- * ARION ONLY (FEATURES row 23, 11 Oct 2026; My Brand lives under ARION): a
- * claimed post of a business decided NOT to own ARION is left out — nothing is
- * published and no result is sent back, so the post is not marked done (LUMEN's
- * stall recovery re-offers it later; a re-subscribe publishes it). Publishing
- * is a send, so when ownership cannot be checked every claimed post is held
- * the same way and the next tick asks again.
+ * MY BRAND ONLY (FEATURES row 23, 11 Oct 2026). Social posts are My Brand,
+ * and platform-api answers products.my_brand as owned when the business owns
+ * ARION OR SPARK (the 2026-08-21 ruling that a SPARK business never loses My
+ * Brand; LUMEN's gate reads the same node). This first went in as ARION-only,
+ * which held every SPARK-only business's approved posts. A claimed post of a
+ * business decided NOT to have My Brand is left out: nothing is published and
+ * no result is sent back, so the post is not marked done (LUMEN's stall
+ * recovery re-offers it later; a re-subscribe publishes it). Publishing is a
+ * send, so a business whose subscription cannot be confirmed has its posts
+ * held the same way and the next tick asks again.
  */
 export async function runSocialDispatchTick(log = () => {}, deps = {}) {
   const fetch = deps.fetchImpl || globalThis.fetch;
@@ -148,13 +152,19 @@ export async function runSocialDispatchTick(log = () => {}, deps = {}) {
     return summary;
   }
 
-  const owners = await keepRowsOfOwners("arion", posts, {
-    ownership: deps.ownership, holdWhenUndecided: true, did: "no social post was published",
+  const owners = await keepRowsByPayload("my_brand", posts, {
+    getEntitlements: deps.getEntitlements, holdWhenUndecided: true,
   });
-  summary.left_out = owners.leftOut.length;
-  summary.productOff = owners.summary;
-  for (const p of owners.leftOut) {
-    log(`[social-dispatcher] post=${p.post_id} left as it is — ${owners.held ? "could not confirm the ARION subscription" : "ARION is not in this business's subscription"}`);
+  summary.left_out = owners.notOwned.length + owners.held.length;
+  summary.productOff = {
+    not_owned: owners.notOwned.map((p) => ({ post_id: p.post_id, tenantId: p.tenant_id })),
+    held: owners.held.map((p) => ({ post_id: p.post_id, tenantId: p.tenant_id })),
+  };
+  for (const p of owners.notOwned) {
+    log(`[social-dispatcher] post=${p.post_id} left as it is — neither ARION nor SPARK is in this business's subscription, so My Brand social posts are not published`);
+  }
+  for (const p of owners.held) {
+    log(`[social-dispatcher] post=${p.post_id} left as it is — could not confirm this business's subscription just now; asked again next run`);
   }
   posts = owners.kept;
 

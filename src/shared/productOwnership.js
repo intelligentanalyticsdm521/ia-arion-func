@@ -366,6 +366,69 @@ export async function keepRowsOfOwners(product, rows, opts = {}) {
 }
 
 /**
+ * One product node of platform-api's payload, as 'owned' | 'not_owned' |
+ * 'undecided'. No payload, no node, or an undecided node is 'undecided'.
+ */
+export function payloadState(payload, product) {
+  const node = payload?.products?.[String(product || "").toLowerCase()] || null;
+  if (!payload || !node || node.decided === false) return "undecided";
+  if (node.owned === true) return "owned";
+  if (node.owned === false) return "not_owned";
+  return "undecided";
+}
+
+/**
+ * Like keepRowsOfOwners, but answered from platform-api's payload node for
+ * `product`, for a product with no core.tenant_services row of its own. My
+ * Brand is the one today: platform-api answers products.my_brand as owned
+ * when the business owns ARION OR SPARK (the 2026-08-21 ruling that a SPARK
+ * business never loses My Brand).
+ *
+ *   owned               -> kept
+ *   decided not owned   -> left out, UNTOUCHED (nothing marked done)
+ *   undecided           -> holdWhenUndecided (a send or a spend): left out
+ *                          and held, the next run asks again; otherwise kept
+ *                          (a background pull of the business's own data)
+ * One payload read per business per call.
+ *
+ * @returns {Promise<{ kept: any[], notOwned: any[], held: any[], stateOf: Map<string,{state:string,node:object|null}> }>}
+ */
+export async function keepRowsByPayload(product, rows, opts = {}) {
+  const {
+    tenantOf = (r) => r?.tenant_id,
+    getEntitlements = defaultGetEntitlements,
+    holdWhenUndecided = false,
+    log = console,
+  } = opts;
+  const key = String(product || "").toLowerCase();
+  const list = Array.isArray(rows) ? rows : [];
+  const stateOf = new Map();
+  for (const row of list) {
+    const id = tenantOf(row);
+    const k = norm(id);
+    if (!id || stateOf.has(k)) continue;
+    let payload = null;
+    try { payload = await getEntitlements(id); } catch { payload = null; }
+    stateOf.set(k, { state: payloadState(payload, key), node: payload?.products?.[key] || null });
+  }
+  const kept = [];
+  const notOwned = [];
+  const held = [];
+  for (const row of list) {
+    const id = tenantOf(row);
+    const state = id ? stateOf.get(norm(id))?.state : "undecided";
+    if (state === "owned") kept.push(row);
+    else if (state === "not_owned") notOwned.push(row);
+    else if (holdWhenUndecided) held.push(row);
+    else kept.push(row);
+  }
+  if (held.length) {
+    log.warn?.("[productOwnership]", `could not confirm ${key} for ${held.length} row(s), so they were held and are asked about again next run`);
+  }
+  return { kept, notOwned, held, stateOf };
+}
+
+/**
  * What a runner's summary says about the check, in one object:
  *   { product, skipped: [{ tenantId, reason, ended, note }], undecided, error, unknown, unconfirmed }
  * `did` names what this runner did not do ("the Responder did not answer this
@@ -385,4 +448,4 @@ export function ownershipSummary(verdict, did) {
   };
 }
 
-export default { filterOwned, checkOwnership, keepRowsOfOwners, timerStopsLive, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };
+export default { filterOwned, checkOwnership, keepRowsOfOwners, keepRowsByPayload, payloadState, timerStopsLive, ownershipSummary, skipSentence, clearOwnershipCache, productName, ownedJsonOrNull, serviceKeyFor, fetchEntitlements };

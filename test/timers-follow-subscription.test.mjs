@@ -335,20 +335,27 @@ const POSTS = [
   { post_id: "p-on", tenant_id: ON, body_default: "Hello", targets: [{ platform: "facebook", access_token_kv_ref: "kv-1", page_id: "1" }] },
   { post_id: "p-off", tenant_id: OFF, body_default: "Hello", targets: [{ platform: "facebook", access_token_kv_ref: "kv-2", page_id: "2" }] },
 ];
-async function dispatch(ownership) {
+// Social posts are My Brand: platform-api answers products.my_brand as owned
+// when the business owns ARION OR SPARK.
+const myBrand = (byTenant) => async (id) => {
+  const v = byTenant[id];
+  if (v === undefined) return null; // platform-api did not answer
+  return { decided: true, products: { my_brand: { owned: v, tier: v ? "standard" : null, decided: true } } };
+};
+async function dispatch(getEntitlements, posts = POSTS) {
   const patched = [];
   const published = [];
   const summary = await runSocialDispatchTick(() => {}, {
-    ownership,
-    fetchImpl: socialFetch(POSTS, patched),
+    getEntitlements,
+    fetchImpl: socialFetch(posts, patched),
     getSecret: async () => "token",
     publishers: { facebook: async (args) => { published.push(args.pageId); return { ok: true, external_post_id: "x" }; } },
   });
   return { summary, patched, published };
 }
 
-test("social dispatcher: a post of a business without ARION is not published and not marked done", async () => {
-  const { summary, patched, published } = await dispatch(ownershipOver(offPlatform()));
+test("social dispatcher: a post of a business without My Brand (neither ARION nor SPARK) is not published and not marked done", async () => {
+  const { summary, patched, published } = await dispatch(myBrand({ [ON]: true, [OFF]: false }));
   assert.deepEqual(published, ["1"], "only the owned business's post goes out");
   assert.equal(patched.length, 1);
   assert.ok(patched[0].includes("p-on"));
@@ -357,7 +364,25 @@ test("social dispatcher: a post of a business without ARION is not published and
 });
 
 test("social dispatcher: undecided holds every post (nothing published, nothing marked)", async () => {
-  const { published, patched } = await dispatch(ownershipUnreachable());
-  assert.equal(published.length, 0);
-  assert.equal(patched.length, 0);
+  for (const getEntitlements of [myBrand({}), async (id) => ({ decided: false, products: { my_brand: { owned: true, decided: false } } })]) {
+    const { published, patched } = await dispatch(getEntitlements);
+    assert.equal(published.length, 0);
+    assert.equal(patched.length, 0);
+  }
+});
+
+test("social dispatcher: a SPARK-only business has My Brand, so its approved post is published", async () => {
+  // The platform-api payload as it answers a business with SPARK and no ARION.
+  const sparkOnly = async () => ({
+    decided: true,
+    products: {
+      arion: { owned: false, tier: null, decided: true },
+      spark: { owned: true, tier: "standard", decided: true },
+      my_brand: { owned: true, tier: "standard", decided: true },
+    },
+  });
+  const { published, patched, summary } = await dispatch(sparkOnly, [POSTS[0]]);
+  assert.deepEqual(published, ["1"]);
+  assert.equal(patched.length, 1);
+  assert.equal(summary.left_out, 0);
 });
