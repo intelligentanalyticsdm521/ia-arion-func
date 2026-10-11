@@ -58,3 +58,4 @@ import "./functions/sparkCampaignAgentWeekly.js";
 // → arion-api POST /internal/booking-button-sync-tick (FEATURES row 17).
 // Kill switch BOOKING_BUTTON_SYNC_DISABLED.
 import "./functions/bookingButtonSync.js";
+import "./functions/subscriptionConfigSync.js";
