@@ -54,3 +54,7 @@ import "./functions/leadgenMonthlyRescore.js";
 //     CAMPAIGN_AGENT_DISABLED. Drafts only; approving and sending stay human.
 import "./functions/contentAgentWeekly.js";
 import "./functions/sparkCampaignAgentWeekly.js";
+// Website "Book now" button follows the OLIVER subscription — daily 06:07 UTC
+// → arion-api POST /internal/booking-button-sync-tick (FEATURES row 17).
+// Kill switch BOOKING_BUTTON_SYNC_DISABLED.
+import "./functions/bookingButtonSync.js";
